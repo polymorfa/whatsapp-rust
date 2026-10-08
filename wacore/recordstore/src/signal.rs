@@ -7,6 +7,7 @@ use wacore::store::error::{Result, StoreError};
 use wacore::store::traits::SignalStore;
 
 const AAD_DOMAIN: &[u8] = b"wacore-recordstore/v1";
+const DEVICE_KEY: &str = "local";
 
 /// Prekey plaintext starts with this flag byte, then the libsignal record.
 const PREKEY_NOT_UPLOADED: u8 = 0;
@@ -112,6 +113,16 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
             })
             .collect();
         self.write(&ops).await
+    }
+
+    /// The local device's sealed key blob, if the scope has been initialised.
+    pub async fn load_device(&self) -> Result<Option<Vec<u8>>> {
+        self.load(Namespace::Device, DEVICE_KEY).await
+    }
+
+    /// Replace the local device's key blob, fenced like every other write.
+    pub async fn save_device(&self, blob: &[u8]) -> Result<()> {
+        self.put_one(Namespace::Device, DEVICE_KEY, blob).await
     }
 
     async fn any_key_with_prefix(&self, ns: Namespace, prefix: &str) -> Result<bool> {
@@ -409,6 +420,21 @@ mod tests {
             lease.fence,
         );
         (records, store)
+    }
+
+    #[test]
+    fn device_blob_round_trips_sealed_and_fenced() {
+        let (records, store) = setup();
+        assert_eq!(block_on(store.load_device()).unwrap(), None);
+        block_on(store.save_device(b"identity-private")).unwrap();
+        assert_eq!(
+            block_on(store.load_device()).unwrap().as_deref(),
+            Some(&b"identity-private"[..])
+        );
+        let raw = block_on(records.get("device-1", Namespace::Device, "local"))
+            .unwrap()
+            .unwrap();
+        assert!(!raw.windows(16).any(|w| w == b"identity-private"));
     }
 
     #[test]

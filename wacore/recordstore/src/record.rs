@@ -10,15 +10,19 @@ pub enum Namespace {
     PreKey,
     SignedPreKey,
     SenderKey,
+    /// The local device's own keys (identity, registration ID, ADV secret,
+    /// current signed prekey). Read and written whole by the Signal service.
+    Device,
 }
 
 impl Namespace {
-    pub const ALL: [Namespace; 5] = [
+    pub const ALL: [Namespace; 6] = [
         Namespace::Identity,
         Namespace::Session,
         Namespace::PreKey,
         Namespace::SignedPreKey,
         Namespace::SenderKey,
+        Namespace::Device,
     ];
 
     /// Stable persisted name.
@@ -29,6 +33,7 @@ impl Namespace {
             Namespace::PreKey => "prekey",
             Namespace::SignedPreKey => "signed_prekey",
             Namespace::SenderKey => "sender_key",
+            Namespace::Device => "device",
         }
     }
 }
