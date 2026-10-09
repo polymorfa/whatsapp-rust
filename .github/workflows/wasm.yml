@@ -102,6 +102,21 @@ jobs:
           cargo build -p wacore-signal-ops --lib --release
           --target wasm32-unknown-unknown
           --features wacore/js
+      # The JS bindings are only proven by running them: build, generate the
+      # Node glue with the wasm-bindgen CLI matching Cargo.lock, and drive two
+      # devices end to end from JavaScript.
+      - name: Install wasm-bindgen CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.128
+      - name: Test wacore-signal-wasm bindings from Node
+        env:
+          RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
+        run: |
+          cargo build -p wacore-signal-wasm --lib --release --target wasm32-unknown-unknown
+          wasm-bindgen --target nodejs --out-dir target/signal-wasm-node \
+            target/wasm32-unknown-unknown/release/wacore_signal_wasm.wasm
+          node --test wacore/signal-wasm/tests/node.test.mjs
       - name: Guard sqlite-storage's platform shim
         run: cargo xt ci workflow guard-sqlite-shim
       # The sans-IO VoIP core (wacore::voip: the CallEngine, the portable run_call driver,
