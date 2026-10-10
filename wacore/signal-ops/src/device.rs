@@ -13,6 +13,13 @@ pub struct DeviceKeys {
     pub signed_prekey_signature: [u8; 64],
     /// Next one-time prekey ID to hand out. WhatsApp IDs are 24-bit.
     pub next_prekey_id: u32,
+    /// Encoded `ADVSignedDeviceIdentity` from pairing. Sent with prekey
+    /// messages so recipients can verify this device belongs to the account.
+    pub account: Option<Vec<u8>>,
+    /// This device's phone-number JID (`user:device@s.whatsapp.net`).
+    pub own_pn: Option<String>,
+    /// This device's LID (`user:device@lid`).
+    pub own_lid: Option<String>,
 }
 
 /// Everything the WhatsApp client needs to register and pair the device.
@@ -41,7 +48,9 @@ pub struct PublicPreKey {
 }
 
 const FORMAT_V1: u8 = 1;
-const ENCODED_LEN: usize = 1 + 32 + 4 + 32 + 4 + 32 + 64 + 4;
+const FORMAT_V2: u8 = 2;
+/// Fixed part shared by both formats; format 2 appends the paired identity.
+const FIXED_LEN: usize = 1 + 32 + 4 + 32 + 4 + 32 + 64 + 4;
 /// One-time prekey IDs are 3 bytes on the wire.
 pub(crate) const MAX_PREKEY_ID: u32 = 0x00FF_FFFF;
 
@@ -72,6 +81,9 @@ impl DeviceKeys {
             signed_prekey,
             signed_prekey_signature,
             next_prekey_id: 1,
+            account: None,
+            own_pn: None,
+            own_lid: None,
         })
     }
 
@@ -92,12 +104,14 @@ impl DeviceKeys {
         }
     }
 
-    /// Layout, format 1: version, identity private, registration ID, ADV
-    /// secret, signed prekey ID, signed prekey private, signature, next
-    /// prekey ID. Integers are big-endian. Public keys are derived on load.
+    /// Layout, format 2: version, identity private, registration ID, ADV
+    /// secret, signed prekey ID, signed prekey private, signature, next prekey
+    /// ID, then three length-prefixed fields (u32 account, u16 own PN, u16 own
+    /// LID; length 0 means absent). Integers are big-endian. Public keys are
+    /// derived on load. Format 1 is the fixed part alone and still decodes.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(ENCODED_LEN);
-        out.push(FORMAT_V1);
+        let mut out = Vec::with_capacity(FIXED_LEN + 8);
+        out.push(FORMAT_V2);
         out.extend_from_slice(self.identity.private_key.serialize());
         out.extend_from_slice(&self.registration_id.to_be_bytes());
         out.extend_from_slice(&self.adv_secret);
@@ -105,22 +119,33 @@ impl DeviceKeys {
         out.extend_from_slice(self.signed_prekey.private_key.serialize());
         out.extend_from_slice(&self.signed_prekey_signature);
         out.extend_from_slice(&self.next_prekey_id.to_be_bytes());
+        let account = self.account.as_deref().unwrap_or_default();
+        out.extend_from_slice(&(account.len() as u32).to_be_bytes());
+        out.extend_from_slice(account);
+        for jid in [&self.own_pn, &self.own_lid] {
+            let jid = jid.as_deref().unwrap_or_default().as_bytes();
+            out.extend_from_slice(&(jid.len() as u16).to_be_bytes());
+            out.extend_from_slice(jid);
+        }
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, OpsError> {
         let invalid = |what: &str| OpsError::InvalidInput(format!("device keys: {what}"));
-        if bytes.first() != Some(&FORMAT_V1) {
-            return Err(invalid("unsupported format"));
-        }
-        if bytes.len() != ENCODED_LEN {
-            return Err(invalid("wrong length"));
+        let format = *bytes.first().ok_or_else(|| invalid("empty"))?;
+        match format {
+            FORMAT_V1 if bytes.len() == FIXED_LEN => {}
+            FORMAT_V2 if bytes.len() >= FIXED_LEN => {}
+            FORMAT_V1 | FORMAT_V2 => return Err(invalid("wrong length")),
+            _ => return Err(invalid("unsupported format")),
         }
         let mut at = 1;
-        let mut take = |len: usize| {
-            let slice = &bytes[at..at + len];
+        let mut take = |len: usize| -> Result<&[u8], OpsError> {
+            let slice = bytes
+                .get(at..at + len)
+                .ok_or_else(|| invalid("truncated"))?;
             at += len;
-            slice
+            Ok(slice)
         };
         let key_pair = |private: &[u8]| -> Result<KeyPair, OpsError> {
             let private = PrivateKey::deserialize(private).map_err(|_| invalid("private key"))?;
@@ -129,14 +154,31 @@ impl DeviceKeys {
         };
         let u32_at = |s: &[u8]| u32::from_be_bytes([s[0], s[1], s[2], s[3]]);
 
-        let identity = key_pair(take(32))?;
-        let registration_id = u32_at(take(4));
-        let adv_secret: [u8; 32] = take(32).try_into().map_err(|_| invalid("adv secret"))?;
-        let signed_prekey_id = u32_at(take(4));
-        let signed_prekey = key_pair(take(32))?;
+        let identity = key_pair(take(32)?)?;
+        let registration_id = u32_at(take(4)?);
+        let adv_secret: [u8; 32] = take(32)?.try_into().map_err(|_| invalid("adv secret"))?;
+        let signed_prekey_id = u32_at(take(4)?);
+        let signed_prekey = key_pair(take(32)?)?;
         let signed_prekey_signature: [u8; 64] =
-            take(64).try_into().map_err(|_| invalid("signature"))?;
-        let next_prekey_id = u32_at(take(4));
+            take(64)?.try_into().map_err(|_| invalid("signature"))?;
+        let next_prekey_id = u32_at(take(4)?);
+        let (mut account, mut own_pn, mut own_lid) = (None, None, None);
+        if format == FORMAT_V2 {
+            let len = u32_at(take(4)?) as usize;
+            account = Some(take(len)?.to_vec()).filter(|a| !a.is_empty());
+            let mut jid = || -> Result<Option<String>, OpsError> {
+                let len_bytes = take(2)?;
+                let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                let raw = take(len)?;
+                let text = std::str::from_utf8(raw).map_err(|_| invalid("jid is not UTF-8"))?;
+                Ok(Some(text.to_owned()).filter(|j| !j.is_empty()))
+            };
+            own_pn = jid()?;
+            own_lid = jid()?;
+        }
+        if at != bytes.len() {
+            return Err(invalid("trailing bytes"));
+        }
         Ok(Self {
             identity,
             registration_id,
@@ -145,6 +187,9 @@ impl DeviceKeys {
             signed_prekey,
             signed_prekey_signature,
             next_prekey_id,
+            account,
+            own_pn,
+            own_lid,
         })
     }
 }
@@ -189,6 +234,24 @@ mod tests {
             &keys.signed_prekey.public_key.serialize(),
             &keys.signed_prekey_signature
         ));
+    }
+
+    #[test]
+    fn the_paired_identity_round_trips_and_format_1_still_decodes() {
+        let mut keys = DeviceKeys::generate().unwrap();
+        keys.account = Some(vec![1, 2, 3]);
+        keys.own_pn = Some("15550001111:4@s.whatsapp.net".into());
+        keys.own_lid = Some("123456789:4@lid".into());
+        let decoded = DeviceKeys::decode(&keys.encode()).unwrap();
+        assert_eq!(decoded.account, keys.account);
+        assert_eq!(decoded.own_pn, keys.own_pn);
+        assert_eq!(decoded.own_lid, keys.own_lid);
+
+        let mut v1 = keys.encode()[..FIXED_LEN].to_vec();
+        v1[0] = FORMAT_V1;
+        let old = DeviceKeys::decode(&v1).unwrap();
+        assert_eq!(old.public(), keys.public());
+        assert_eq!(old.account, None);
     }
 
     #[test]

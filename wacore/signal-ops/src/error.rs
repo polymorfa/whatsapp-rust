@@ -14,6 +14,10 @@ pub enum OpsError {
     /// answers the server with for the same failure.
     #[error("pairing refused: {code} {text}")]
     Pairing { code: u16, text: &'static str },
+    /// Building an outbound stanza failed, including resolver (device list,
+    /// prekey fetch) failures reported by the WhatsApp client.
+    #[error("send failed: {0}")]
+    Send(String),
     /// The scope has no device keys yet; call `SignalOps::create`.
     #[error("device keys are not initialised for this scope")]
     NotInitialised,

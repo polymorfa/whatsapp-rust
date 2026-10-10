@@ -172,13 +172,7 @@ impl<S: ServiceStore> SignalOps<S> {
     /// distributions inside it are stored in the same batch as the decrypt.
     pub async fn receive(&self, request: ReceiveRequest<'_>) -> Result<Received, OpsError> {
         let receipt_key = receipt_key(&request);
-        // Pairwise traffic shares the sender's session lock; group traffic
-        // serialises per sender chain.
-        let lock_key = match request.kind {
-            ReceiveKind::SenderKey => format!("{}\u{0}{}", request.chat, request.sender.as_str()),
-            _ => request.sender.as_str().to_owned(),
-        };
-        let lock = self.address_lock(&lock_key);
+        let lock = self.session_lock();
         let _guard = lock.lock().await;
 
         if let Some(bytes) = self

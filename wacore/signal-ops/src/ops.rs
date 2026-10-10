@@ -129,14 +129,16 @@ pub struct PairingSignature {
 
 /// Signal operations for one scope (one linked device).
 ///
-/// Writes to a session or sender key are serialised per address inside this
-/// value; the store's lease fencing protects against a second node.
+/// Every operation that changes Signal state holds one lock per device:
+/// staged views commit whole batches, so two concurrent views writing the
+/// same session would lose a ratchet step. The store's lease fencing protects
+/// against a second node.
 pub struct SignalOps<S> {
     store: Arc<S>,
     keys: RwLock<Arc<DeviceKeys>>,
     /// Held while device keys are read-modify-written.
     device_write: Mutex<()>,
-    address_locks: KeyedLocks,
+    session_lock: Arc<Mutex<()>>,
     sender_key_locks: Arc<KeyedLocks>,
 }
 
@@ -177,7 +179,7 @@ impl<S: ServiceStore> SignalOps<S> {
             store,
             keys: RwLock::new(Arc::new(keys)),
             device_write: Mutex::new(()),
-            address_locks: KeyedLocks::default(),
+            session_lock: Arc::new(Mutex::new(())),
             sender_key_locks: Arc::new(KeyedLocks::default()),
         }
     }
@@ -198,8 +200,26 @@ impl<S: ServiceStore> SignalOps<S> {
         &self.store
     }
 
-    pub(crate) fn address_lock(&self, key: &str) -> Arc<Mutex<()>> {
-        self.address_locks.get(key)
+    pub(crate) fn session_lock(&self) -> Arc<Mutex<()>> {
+        self.session_lock.clone()
+    }
+
+    pub(crate) async fn keys(&self) -> Arc<DeviceKeys> {
+        self.keys.read().await.clone()
+    }
+
+    /// Record this device's own JIDs once the client knows them (after pair
+    /// success). Sends need them to build own-device copies.
+    pub async fn set_own_jids(&self, pn: &str, lid: Option<&str>) -> Result<(), OpsError> {
+        for jid in std::iter::once(pn).chain(lid) {
+            jid.parse::<wacore_binary::Jid>()
+                .map_err(|_| OpsError::InvalidInput(format!("{jid} is not a JID")))?;
+        }
+        let _guard = self.device_write.lock().await;
+        let mut keys = (**self.keys.read().await).clone();
+        keys.own_pn = Some(pn.to_owned());
+        keys.own_lid = lid.map(str::to_owned);
+        self.replace_keys(keys).await
     }
 
     async fn replace_keys(&self, keys: DeviceKeys) -> Result<(), OpsError> {
@@ -299,7 +319,7 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
-        let lock = self.address_locks.get(address.as_str());
+        let lock = self.session_lock.clone();
         let _guard = lock.lock().await;
         let prekey = match bundle.prekey {
             Some((id, key)) => Some((id.into(), public_key(&key, "prekey")?)),
@@ -336,7 +356,7 @@ impl<S: ServiceStore> SignalOps<S> {
         kind: EncKind,
         ciphertext: &[u8],
     ) -> Result<Decrypted, OpsError> {
-        let lock = self.address_locks.get(sender.as_str());
+        let lock = self.session_lock.clone();
         let _guard = lock.lock().await;
         let staged = Arc::new(self.store.staged());
         let decrypted = self.decrypt_into(&staged, sender, kind, ciphertext).await?;
@@ -398,7 +418,7 @@ impl<S: ServiceStore> SignalOps<S> {
         recipient: &ProtocolAddress,
         plaintext: &[u8],
     ) -> Result<Encrypted, OpsError> {
-        let lock = self.address_locks.get(recipient.as_str());
+        let lock = self.session_lock.clone();
         let _guard = lock.lock().await;
         let mut sessions = self.stores().await;
         let mut identities = sessions.clone();
@@ -426,6 +446,8 @@ impl<S: ServiceStore> SignalOps<S> {
         own_address: &ProtocolAddress,
     ) -> Result<Vec<u8>, OpsError> {
         let name = SenderKeyName::from_parts(group, own_address.as_str());
+        let lock = self.session_lock.clone();
+        let _guard = lock.lock().await;
         let mut store = self.stores().await;
         let skdm = create_sender_key_distribution_message(&name, &mut store, &mut rng()).await?;
         Ok(skdm.serialized().to_vec())
@@ -439,6 +461,8 @@ impl<S: ServiceStore> SignalOps<S> {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, OpsError> {
         let name = SenderKeyName::from_parts(group, own_address.as_str());
+        let lock = self.session_lock.clone();
+        let _guard = lock.lock().await;
         let mut store = self.stores().await;
         let message = group_encrypt(&mut store, &name, plaintext, &mut rng()).await?;
         Ok(message.serialized().to_vec())
@@ -494,6 +518,8 @@ impl<S: ServiceStore> SignalOps<S> {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, OpsError> {
         let name = SenderKeyName::from_parts(group, sender.as_str());
+        let lock = self.session_lock.clone();
+        let _guard = lock.lock().await;
         let mut store = self.stores().await;
         Ok(group_decrypt(ciphertext, &mut store, &name).await?)
     }
@@ -515,6 +541,11 @@ impl<S: ServiceStore> SignalOps<S> {
             code: e.code,
             text: e.text,
         })?;
+        // Kept for prekey messages, which carry the device identity.
+        let _guard = self.device_write.lock().await;
+        let mut updated = (**self.keys.read().await).clone();
+        updated.account = Some(signed_identity.clone());
+        self.replace_keys(updated).await?;
         Ok(PairingSignature {
             signed_identity,
             key_index,

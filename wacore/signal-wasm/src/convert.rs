@@ -39,6 +39,7 @@ pub fn ops_error(error: OpsError) -> JsValue {
         }
         OpsError::InvalidInput(message) => coded_error("invalid_input", &message),
         OpsError::NotInitialised => coded_error("not_initialised", "scope has no device keys"),
+        OpsError::Send(message) => coded_error("send", &message),
         OpsError::Signal(e) => coded_error("signal", &e.to_string()),
         OpsError::Store(e) => coded_error("store", &error_chain(&e)),
     }

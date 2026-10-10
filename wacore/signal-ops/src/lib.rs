@@ -15,6 +15,7 @@ mod device;
 mod error;
 mod inbound;
 mod ops;
+mod outbound;
 mod stores;
 
 pub use device::{DeviceKeys, PublicIdentity, PublicPreKey, PublicSignedPreKey};
@@ -23,3 +24,4 @@ pub use inbound::{ReceiveKind, ReceiveRequest, Received, ReceivedMessage};
 pub use ops::{
     Decrypted, EncKind, Encrypted, PairingSignature, RemoteBundle, ServiceStore, SignalOps,
 };
+pub use outbound::PreparedSend;

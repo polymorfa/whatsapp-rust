@@ -10,6 +10,7 @@ description = "Signal operations for a WhatsApp linked device whose keys live ou
 publish = false
 
 [dependencies]
+anyhow = { workspace = true }
 async-lock = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
@@ -18,10 +19,13 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 wacore = { workspace = true }
+wacore-binary = { workspace = true }
 wacore-recordstore = { path = "../recordstore" }
 waproto = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 buffa = { workspace = true }
 futures = { workspace = true, features = ["executor"] }
 hmac = { workspace = true }
