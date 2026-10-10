@@ -44,6 +44,10 @@ impl Runtime for TokioRuntime {
 }
 
 async fn device(scope: &str, own_pn: &str) -> SignalOps<Store> {
+    device_with_lid(scope, own_pn, None).await
+}
+
+async fn device_with_lid(scope: &str, own_pn: &str, own_lid: Option<&str>) -> SignalOps<Store> {
     let records = Arc::new(MemoryRecordStore::new());
     let lease = records
         .acquire(scope, "node-a", 0, 60_000)
@@ -56,7 +60,7 @@ async fn device(scope: &str, own_pn: &str) -> SignalOps<Store> {
         lease.fence,
     ));
     let ops = SignalOps::create(store).await.unwrap();
-    ops.set_own_jids(own_pn, None).await.unwrap();
+    ops.set_own_jids(own_pn, own_lid).await.unwrap();
     ops
 }
 
@@ -65,6 +69,7 @@ async fn device(scope: &str, own_pn: &str) -> SignalOps<Store> {
 struct FakeClient {
     devices: Vec<Jid>,
     bundles: HashMap<Jid, PreKeyBundle>,
+    group: Option<Arc<GroupRoutingInfo>>,
 }
 
 #[async_trait]
@@ -97,7 +102,9 @@ impl SendContextResolver for FakeClient {
         &self,
         _jid: &Jid,
     ) -> Result<Arc<GroupRoutingInfo>, anyhow::Error> {
-        anyhow::bail!("not a group test")
+        self.group
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("not a group test"))
     }
 }
 
@@ -119,19 +126,13 @@ async fn bundle_for(ops: &SignalOps<Store>) -> PreKeyBundle {
     .unwrap()
 }
 
-/// The `<enc>` addressed to `device` inside a marshaled stanza.
-fn enc_for(stanza: &[u8], device: &Jid) -> (String, u8, Vec<u8>) {
-    let node = wacore_binary::marshal::unmarshal_packed_ref(stanza)
+fn parse(stanza: &[u8]) -> wacore_binary::Node {
+    wacore_binary::marshal::unmarshal_packed_ref(stanza)
         .unwrap()
-        .to_owned();
-    let participants = node.get_optional_child("participants").expect("fan-out");
-    let to = participants
-        .get_children_by_tag("to")
-        .find(|to| {
-            to.attrs().optional_string("jid").as_deref() == Some(device.to_string().as_str())
-        })
-        .expect("an entry for the device");
-    let enc = to.get_optional_child("enc").expect("enc");
+        .to_owned()
+}
+
+fn enc_parts(enc: &wacore_binary::Node) -> (String, u8, Vec<u8>) {
     let kind = enc.attrs().optional_string("type").unwrap().to_string();
     let version = enc
         .attrs()
@@ -141,6 +142,31 @@ fn enc_for(stanza: &[u8], device: &Jid) -> (String, u8, Vec<u8>) {
         panic!("enc without bytes")
     };
     (kind, version, bytes.clone())
+}
+
+/// The pairwise `<enc>` addressed to `device`, if the stanza has one.
+fn pairwise_enc_for(stanza: &[u8], device: &Jid) -> Option<(String, u8, Vec<u8>)> {
+    let node = parse(stanza);
+    let participants = node.get_optional_child("participants")?;
+    let to = participants.get_children_by_tag("to").find(|to| {
+        to.attrs().optional_string("jid").as_deref() == Some(device.to_string().as_str())
+    })?;
+    Some(enc_parts(to.get_optional_child("enc").expect("enc")))
+}
+
+/// The `<enc>` addressed to `device` inside a marshaled stanza.
+fn enc_for(stanza: &[u8], device: &Jid) -> (String, u8, Vec<u8>) {
+    pairwise_enc_for(stanza, device).expect("an entry for the device")
+}
+
+/// The group-wide `skmsg` `<enc>`.
+fn skmsg_of(stanza: &[u8]) -> (String, u8, Vec<u8>) {
+    let node = parse(stanza);
+    let enc = node
+        .get_children_by_tag("enc")
+        .find(|e| e.attrs().optional_string("type").as_deref() == Some("skmsg"))
+        .expect("skmsg");
+    enc_parts(enc)
 }
 
 fn text(body: &str) -> wa::Message {
@@ -159,6 +185,7 @@ async fn a_stanza_built_by_the_service_decrypts_at_the_recipient() {
     let client = FakeClient {
         devices: vec![bob_jid.clone()],
         bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        group: None,
     };
     let to = bob_jid.to_non_ad();
 
@@ -218,6 +245,7 @@ async fn an_unpaired_device_refuses_to_send() {
     let client = FakeClient {
         devices: Vec::new(),
         bundles: HashMap::new(),
+        group: None,
     };
     let to: Jid = "222@s.whatsapp.net".parse().unwrap();
     assert!(
@@ -225,4 +253,97 @@ async fn an_unpaired_device_refuses_to_send() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
+    use wacore::types::message::AddressingMode;
+
+    let group: Jid = "120363000000001@g.us".parse().unwrap();
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    // A primary device, so the primary-device gate is met once it is marked.
+    let bob_jid: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        "alice-group-send",
+        "111:1@s.whatsapp.net",
+        Some("900111:1@lid"),
+    )
+    .await;
+    let bob = device("bob-group-send", "222@s.whatsapp.net").await;
+    let client = FakeClient {
+        devices: vec![alice_jid.clone(), bob_jid.clone()],
+        bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        group: Some(Arc::new(GroupRoutingInfo::new(
+            vec![alice_jid.to_non_ad(), bob_jid.clone()],
+            AddressingMode::Pn,
+        ))),
+    };
+    let alice_addr = alice_jid.to_protocol_address();
+    let group_str = group.to_string();
+    let receive = |kind: &str, version: u8, ciphertext: Vec<u8>| {
+        let sender = alice_addr.clone();
+        let chat = group_str.clone();
+        let kind = match kind {
+            "pkmsg" => ReceiveKind::PreKey,
+            "msg" => ReceiveKind::Message,
+            _ => ReceiveKind::SenderKey,
+        };
+        let bob = &bob;
+        async move {
+            bob.receive(ReceiveRequest {
+                chat: &chat,
+                sender: &sender,
+                kind,
+                ciphertext: &ciphertext,
+                padding_version: version,
+                is_from_me: false,
+            })
+            .await
+            .unwrap()
+        }
+    };
+
+    let first = alice
+        .send_group(&TokioRuntime, &client, &group, &text("hello group"), "G1")
+        .await
+        .unwrap();
+    assert_eq!(first.distribution_targets, vec![bob_jid.clone()]);
+    let (kind, version, carrier) = pairwise_enc_for(&first.stanza, &bob_jid).expect("key for bob");
+    let Received::Message(_) = receive(&kind, version, carrier).await else {
+        panic!("sender key carrier was not delivered")
+    };
+    let (_, version, skmsg) = skmsg_of(&first.stanza);
+    let Received::Message(message) = receive("skmsg", version, skmsg).await else {
+        panic!("expected the group message")
+    };
+    assert_eq!(
+        message.content.message.conversation.as_deref(),
+        Some("hello group")
+    );
+
+    alice
+        .mark_sender_key_distributed(&group, &first.distribution_targets)
+        .await
+        .unwrap();
+    let second = alice
+        .send_group(&TokioRuntime, &client, &group, &text("second"), "G2")
+        .await
+        .unwrap();
+    assert!(second.distribution_targets.is_empty());
+    assert!(pairwise_enc_for(&second.stanza, &bob_jid).is_none());
+    let (_, version, skmsg) = skmsg_of(&second.stanza);
+    let Received::Message(message) = receive("skmsg", version, skmsg).await else {
+        panic!("expected the group message")
+    };
+    assert_eq!(
+        message.content.message.conversation.as_deref(),
+        Some("second")
+    );
+
+    alice.forget_sender_key_devices(&group).await.unwrap();
+    let third = alice
+        .send_group(&TokioRuntime, &client, &group, &text("third"), "G3")
+        .await
+        .unwrap();
+    assert_eq!(third.distribution_targets, vec![bob_jid.clone()]);
 }

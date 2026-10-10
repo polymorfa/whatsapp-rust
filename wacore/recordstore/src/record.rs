@@ -18,10 +18,12 @@ pub enum Namespace {
     DecryptBuffer,
     /// Messages this device sent, kept so a retry receipt can re-encrypt them.
     SentMessage,
+    /// Group member devices confirmed to hold this device's sender key.
+    SenderKeyDevices,
 }
 
 impl Namespace {
-    pub const ALL: [Namespace; 8] = [
+    pub const ALL: [Namespace; 9] = [
         Namespace::Identity,
         Namespace::Session,
         Namespace::PreKey,
@@ -30,6 +32,7 @@ impl Namespace {
         Namespace::Device,
         Namespace::DecryptBuffer,
         Namespace::SentMessage,
+        Namespace::SenderKeyDevices,
     ];
 
     /// Stable persisted name.
@@ -43,6 +46,7 @@ impl Namespace {
             Namespace::Device => "device",
             Namespace::DecryptBuffer => "decrypt_buffer",
             Namespace::SentMessage => "sent_message",
+            Namespace::SenderKeyDevices => "sender_key_devices",
         }
     }
 }
