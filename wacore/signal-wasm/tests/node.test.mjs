@@ -277,3 +277,53 @@ test("receive buffers until delivered and recognises redelivery after", async ()
   assert.equal(after.status, "already_delivered");
   assert.equal(bob.backend.containsBytes(text("hello from js")), false);
 });
+
+function conversation(body) {
+  const utf8 = text(body);
+  return Uint8Array.from([0x0a, utf8.length, ...utf8]);
+}
+
+test("sends are built in the page and only ask the resolver for devices and keys", async () => {
+  const alice = await device("alice-send-js");
+  const bob = await device("bob-send-js");
+  await alice.signal.setOwnJids("111:1@s.whatsapp.net", "900111:1@lid");
+  const bobDevice = "222:1@s.whatsapp.net";
+  const bobBundle = await bundleFor(bob.signal);
+  const calls = { devices: [], prekeys: [] };
+  const resolver = {
+    async resolveDevices(jids) {
+      calls.devices.push(jids);
+      return [bobDevice];
+    },
+    async fetchPrekeys(jids) {
+      calls.prekeys.push(jids);
+      return Object.fromEntries(jids.filter((j) => j === bobDevice).map((j) => [j, bobBundle]));
+    },
+    async resolveGroup() {
+      return {
+        participants: ["111@s.whatsapp.net", "222@s.whatsapp.net"],
+        addressingMode: "pn",
+      };
+    },
+  };
+
+  const first = await alice.signal.sendDirect(resolver, "222@s.whatsapp.net", conversation("hi"), "J1");
+  assert.ok(first.stanza instanceof Uint8Array && first.stanza.length > 0);
+  assert.deepEqual(first.unreachedDevices, []);
+  assert.deepEqual(calls.devices[0].sort(), ["111@s.whatsapp.net", "222@s.whatsapp.net"]);
+  assert.deepEqual(calls.prekeys, [[bobDevice]]);
+
+  await alice.signal.sendDirect(resolver, "222@s.whatsapp.net", conversation("again"), "J2");
+  assert.equal(calls.prekeys.length, 1, "an established session needs no new bundle");
+  assert.equal(alice.backend.containsBytes(text("again")), false);
+
+  const group = await alice.signal.sendGroup(resolver, "120363000000001@g.us", conversation("g"), "G1");
+  assert.ok(group.stanza.length > 0);
+  assert.deepEqual(group.distributionTargets, [bobDevice]);
+
+  const unpaired = await device("unpaired-js");
+  await assert.rejects(
+    unpaired.signal.sendDirect(resolver, "222@s.whatsapp.net", conversation("x"), "J3"),
+    (error) => error.code === "invalid_input",
+  );
+});

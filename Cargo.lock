@@ -5362,11 +5362,13 @@ dependencies = [
 name = "wacore-signal-wasm"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "getrandom 0.4.3",
  "js-sys",
  "send_wrapper",
  "wacore",
+ "wacore-binary",
  "wacore-recordstore",
  "wacore-signal-ops",
  "waproto",

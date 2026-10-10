@@ -119,6 +119,25 @@ pub struct RemoteBundle {
     pub prekey: Option<(u32, [u8; 32])>,
 }
 
+impl RemoteBundle {
+    /// The libsignal bundle, validating every key.
+    pub fn to_prekey_bundle(&self) -> Result<PreKeyBundle, OpsError> {
+        let prekey = match self.prekey {
+            Some((id, key)) => Some((id.into(), public_key(&key, "prekey")?)),
+            None => None,
+        };
+        Ok(PreKeyBundle::new(
+            self.registration_id,
+            DeviceId::from(self.device_id),
+            prekey,
+            self.signed_prekey_id.into(),
+            public_key(&self.signed_prekey, "signed prekey")?,
+            self.signed_prekey_signature,
+            IdentityKey::new(public_key(&self.identity_key, "identity key")?),
+        )?)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingSignature {
     /// `ADVSignedDeviceIdentity` with the device signature added, ready for the
@@ -335,19 +354,7 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
-        let prekey = match bundle.prekey {
-            Some((id, key)) => Some((id.into(), public_key(&key, "prekey")?)),
-            None => None,
-        };
-        let bundle = PreKeyBundle::new(
-            bundle.registration_id,
-            DeviceId::from(bundle.device_id),
-            prekey,
-            bundle.signed_prekey_id.into(),
-            public_key(&bundle.signed_prekey, "signed prekey")?,
-            bundle.signed_prekey_signature,
-            IdentityKey::new(public_key(&bundle.identity_key, "identity key")?),
-        )?;
+        let bundle = bundle.to_prekey_bundle()?;
         let mut sessions = self.stores_over(staged.clone()).await;
         let mut identities = sessions.clone();
         process_prekey_bundle(

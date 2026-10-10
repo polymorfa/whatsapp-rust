@@ -207,3 +207,21 @@ pub fn to_lease(value: &JsValue) -> Result<Lease, String> {
         expires_at_ms,
     })
 }
+
+pub fn jid(value: &str) -> Result<wacore_binary::Jid, JsValue> {
+    value
+        .parse()
+        .map_err(|_| invalid(&format!("{value} is not a JID")))
+}
+
+pub fn jid_list(jids: &[wacore_binary::Jid]) -> JsValue {
+    jids.iter()
+        .map(|j| JsValue::from_str(&j.to_string()))
+        .collect::<Array>()
+        .into()
+}
+
+pub fn message(bytes: &[u8]) -> Result<waproto::whatsapp::Message, JsValue> {
+    waproto::codec::message_decode(bytes)
+        .map_err(|e| invalid(&format!("message is not an encoded waE2E.Message: {e}")))
+}

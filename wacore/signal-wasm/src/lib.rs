@@ -7,6 +7,7 @@
 
 mod adapters;
 mod convert;
+mod send;
 
 use adapters::{JsRecords, JsSealerAdapter};
 use convert::{
@@ -457,6 +458,134 @@ impl SignalDevice {
                 .await
                 .map_err(ops_error)?;
             Ok(JsValue::from_f64(removed as f64))
+        })
+    }
+
+    /// Record this device's own JIDs after pair success. Sends need them.
+    #[wasm_bindgen(js_name = setOwnJids)]
+    pub fn set_own_jids(&self, pn: String, lid: Option<String>) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            inner
+                .ops
+                .set_own_jids(&pn, lid.as_deref())
+                .await
+                .map_err(ops_error)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    /// Build a direct-message stanza from an encoded `waE2E.Message`.
+    /// Resolves `{ stanza, unreachedDevices, phash }`; transmit `stanza`
+    /// through the WhatsApp client unchanged.
+    #[wasm_bindgen(js_name = sendDirect)]
+    pub fn send_direct(
+        &self,
+        resolver: send::SendResolver,
+        to: String,
+        message: Vec<u8>,
+        message_id: String,
+    ) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let to = convert::jid(&to)?;
+            let message = convert::message(&message)?;
+            let resolver = send::JsResolver::new(resolver);
+            let sent = inner
+                .ops
+                .send_direct(&send::PageRuntime, &resolver, &to, &message, &message_id)
+                .await
+                .map_err(ops_error)?;
+            let out = Object::new();
+            set(&out, "stanza", &Uint8Array::from(sent.stanza.as_slice()));
+            set(
+                &out,
+                "unreachedDevices",
+                &convert::jid_list(&sent.unreached_devices),
+            );
+            set(
+                &out,
+                "phash",
+                &sent.phash.map_or(JsValue::NULL, |p| JsValue::from_str(&p)),
+            );
+            Ok(out.into())
+        })
+    }
+
+    /// Build a group stanza. Resolves `{ stanza, distributionTargets,
+    /// staleDeviceUsers, phash }`; after the server acks it, pass
+    /// `distributionTargets` to `markSenderKeyDistributed`.
+    #[wasm_bindgen(js_name = sendGroup)]
+    pub fn send_group(
+        &self,
+        resolver: send::SendResolver,
+        group: String,
+        message: Vec<u8>,
+        message_id: String,
+    ) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let group = convert::jid(&group)?;
+            let message = convert::message(&message)?;
+            let resolver = send::JsResolver::new(resolver);
+            let sent = inner
+                .ops
+                .send_group(&send::PageRuntime, &resolver, &group, &message, &message_id)
+                .await
+                .map_err(ops_error)?;
+            let out = Object::new();
+            set(&out, "stanza", &Uint8Array::from(sent.stanza.as_slice()));
+            set(
+                &out,
+                "distributionTargets",
+                &convert::jid_list(&sent.distribution_targets),
+            );
+            let stale: js_sys::Array = sent
+                .stale_device_users
+                .iter()
+                .map(|u| JsValue::from_str(u))
+                .collect();
+            set(&out, "staleDeviceUsers", &stale);
+            set(
+                &out,
+                "phash",
+                &sent.phash.map_or(JsValue::NULL, |p| JsValue::from_str(&p)),
+            );
+            Ok(out.into())
+        })
+    }
+
+    /// Record that the server acked a group send carrying the sender key.
+    #[wasm_bindgen(js_name = markSenderKeyDistributed)]
+    pub fn mark_sender_key_distributed(&self, group: String, devices: Vec<String>) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let group = convert::jid(&group)?;
+            let devices = devices
+                .iter()
+                .map(|d| convert::jid(d))
+                .collect::<Result<Vec<_>, _>>()?;
+            inner
+                .ops
+                .mark_sender_key_distributed(&group, &devices)
+                .await
+                .map_err(ops_error)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    /// Make the next group send distribute the sender key again.
+    #[wasm_bindgen(js_name = forgetSenderKeyDevices)]
+    pub fn forget_sender_key_devices(&self, group: String) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let group = convert::jid(&group)?;
+            inner
+                .ops
+                .forget_sender_key_devices(&group)
+                .await
+                .map_err(ops_error)?;
+            Ok(JsValue::UNDEFINED)
         })
     }
 
