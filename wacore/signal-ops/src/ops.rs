@@ -19,6 +19,8 @@ use wacore::libsignal::store::sender_key_name::SenderKeyName;
 use wacore::pair::PairUtils;
 use wacore::store::error::Result as StoreResult;
 use wacore::store::traits::SignalStore;
+use wacore::types::jid::JidExt;
+use wacore_binary::{Jid, Server};
 use wacore_recordstore::{Namespace, RecordSignalStore, RecordStore, Sealer};
 
 /// Storage the Signal service needs beyond [`SignalStore`]: the device key
@@ -166,6 +168,40 @@ pub(crate) type Held = Vec<async_lock::MutexGuardArc<()>>;
 /// Lock key for one peer device's session and identity.
 pub(crate) fn session_key(address: &ProtocolAddress) -> String {
     format!("s:{}", address.as_str())
+}
+
+/// Device ID of `address` if it is a stored Signal address of `user` on
+/// `server`: `{user}@{server}.0` or `{user}:{device}@{server}.0`, with WA Web's
+/// `c.us` spelling for phone numbers.
+fn device_of(address: &str, user: &str, server: Server) -> Option<u16> {
+    let rest = address.strip_prefix(user)?;
+    let (device, rest) = match rest.strip_prefix(':') {
+        Some(tail) => {
+            let at = tail.find('@')?;
+            (tail[..at].parse().ok()?, &tail[at..])
+        }
+        None => (0, rest),
+    };
+    let signal_server = match server {
+        Server::Pn => "c.us",
+        other => other.as_str(),
+    };
+    // The libsignal device suffix: `.0`. Requiring digits keeps `hosted`
+    // from matching `hosted.lid` addresses.
+    let suffix = rest
+        .strip_prefix('@')?
+        .strip_prefix(signal_server)?
+        .strip_prefix('.')?;
+    (!suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())).then_some(device)
+}
+
+/// `server` plus its hosted counterpart, if it has one.
+fn with_hosted(server: Server) -> Vec<Server> {
+    match server {
+        Server::Pn => vec![Server::Pn, Server::Hosted],
+        Server::Lid => vec![Server::Lid, Server::HostedLid],
+        other => vec![other],
+    }
 }
 
 /// Lock key for one sender-key chain.
@@ -370,40 +406,38 @@ impl<S: ServiceStore> SignalOps<S> {
         Ok(public)
     }
 
-    /// Drop the stored identity and sessions of every device of `user`, after
-    /// the server reports that the user's identity changed. The next message
-    /// either way starts a fresh session. Sender keys are left alone: they are
-    /// replaced when the peer distributes a new one.
-    pub async fn forget_user(&self, user: &wacore_binary::Jid) -> Result<(), OpsError> {
-        use wacore::types::jid::JidExt;
-        let mut base = user.clone();
-        base.device = 0;
-        // `{user}@{server}` for device 0, `{user}:{device}@{server}` otherwise.
-        let primary = base.to_signal_address_string();
-        let server = &primary[user.user.len()..];
-        let belongs = |address: &str| {
-            let Some(rest) = address.strip_prefix(user.user.as_str()) else {
-                return false;
-            };
-            let rest = match rest.strip_prefix(':') {
-                Some(device) => match device.find('@') {
-                    Some(at) if device[..at].bytes().all(|b| b.is_ascii_digit()) => &device[at..],
-                    _ => return false,
-                },
-                None => rest,
-            };
-            rest.strip_prefix(server)
-                .is_some_and(|tail| tail.starts_with('.'))
-        };
-        let mut addresses = Vec::new();
+    /// Stored session and identity addresses of every device of `user` on
+    /// `server`, with their device IDs.
+    async fn device_addresses(
+        &self,
+        user: &str,
+        server: Server,
+    ) -> Result<Vec<(String, u16)>, OpsError> {
+        let mut found = Vec::new();
         for ns in [Namespace::Session, Namespace::Identity] {
-            for address in self.store.scan_peer_addresses(ns, &user.user).await? {
-                if belongs(&address) {
-                    addresses.push(address);
+            for address in self.store.scan_peer_addresses(ns, user).await? {
+                if let Some(device) = device_of(&address, user, server) {
+                    found.push((address, device));
                 }
             }
         }
-        addresses.sort();
+        found.sort();
+        found.dedup();
+        Ok(found)
+    }
+
+    /// Drop the stored identity and sessions of every device of `user`, after
+    /// the server reports that the user's identity changed. A phone-number or
+    /// LID user also covers its hosted devices, as the client does. The next
+    /// message either way starts a fresh session. Sender keys are left alone:
+    /// they are replaced when the peer distributes a new one.
+    pub async fn forget_user(&self, user: &Jid) -> Result<(), OpsError> {
+        let mut addresses = Vec::new();
+        for server in with_hosted(user.server) {
+            for (address, _) in self.device_addresses(&user.user, server).await? {
+                addresses.push(address);
+            }
+        }
         addresses.dedup();
         if addresses.is_empty() {
             return Ok(());
@@ -417,6 +451,61 @@ impl<S: ServiceStore> SignalOps<S> {
         staged.delete_identities_batch(&batch).await?;
         staged.commit().await?;
         Ok(())
+    }
+
+    /// Move a user's sessions and identities from phone-number addresses to
+    /// LID addresses once the client learns the mapping, for regular and
+    /// hosted devices. On a conflict the phone-number session wins (it is the
+    /// one the peer has been using) and an existing LID identity wins. Sender
+    /// keys are not moved; WA Web keeps them where they are. Returns how many
+    /// addresses moved.
+    pub async fn migrate_pn_to_lid(&self, pn: &Jid, lid: &Jid) -> Result<usize, OpsError> {
+        if !pn.is_pn() || !lid.is_lid() {
+            return Err(OpsError::InvalidInput(
+                "migrate_pn_to_lid needs a phone-number JID and a LID".into(),
+            ));
+        }
+        let mut moves = Vec::new();
+        for (from, to) in [
+            (Server::Pn, Server::Lid),
+            (Server::Hosted, Server::HostedLid),
+        ] {
+            for (address, device) in self.device_addresses(&pn.user, from).await? {
+                let target = Jid::new(lid.user.clone(), to).with_device(device);
+                moves.push((address, target.to_protocol_address().as_str().to_owned()));
+            }
+        }
+        if moves.is_empty() {
+            return Ok(0);
+        }
+        let _held = self
+            .lock_keys(
+                moves
+                    .iter()
+                    .flat_map(|(from, to)| [format!("s:{from}"), format!("s:{to}")])
+                    .collect(),
+            )
+            .await;
+        let staged = self.store.staged();
+        let mut moved = 0;
+        for (from, to) in &moves {
+            let mut changed = false;
+            if let Some(session) = staged.get_session(from).await? {
+                staged.put_session(to, &session).await?;
+                staged.delete_session(from).await?;
+                changed = true;
+            }
+            if let Some(identity) = staged.load_identity(from).await? {
+                if staged.load_identity(to).await?.is_none() {
+                    staged.put_identity(to, identity).await?;
+                }
+                staged.delete_identity(from).await?;
+                changed = true;
+            }
+            moved += usize::from(changed);
+        }
+        staged.commit().await?;
+        Ok(moved)
     }
 
     pub async fn has_session(&self, address: &ProtocolAddress) -> Result<bool, OpsError> {

@@ -347,3 +347,15 @@ test("an identity change forgets every session with that user", async () => {
   await alice.signal.establishSession(BOB, 1, await bundleFor(bob.signal));
   assert.equal(await alice.signal.hasSession(BOB, 1), true);
 });
+
+test("sessions follow a user from phone number to LID", async () => {
+  const alice = await device("alice-migrate");
+  const bob = await device("bob-migrate");
+  const BOB_LID = "999@lid";
+  await alice.signal.establishSession(BOB, 1, await bundleFor(bob.signal));
+
+  assert.equal(await alice.signal.migratePnToLid(BOB, BOB_LID), 1);
+  assert.equal(await alice.signal.hasSession(BOB, 1), false);
+  assert.equal(await alice.signal.hasSession(BOB_LID, 1), true);
+  assert.equal(await alice.signal.migratePnToLid(BOB, BOB_LID), 0);
+});

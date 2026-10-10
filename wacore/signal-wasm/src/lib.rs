@@ -611,6 +611,23 @@ impl SignalDevice {
         })
     }
 
+    /// Move a user's sessions and identities from phone-number to LID
+    /// addresses once the mapping is known. Resolves to how many moved.
+    #[wasm_bindgen(js_name = migratePnToLid)]
+    pub fn migrate_pn_to_lid(&self, pn: String, lid: String) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let pn = convert::jid(&pn)?;
+            let lid = convert::jid(&lid)?;
+            let moved = inner
+                .ops
+                .migrate_pn_to_lid(&pn, &lid)
+                .await
+                .map_err(ops_error)?;
+            Ok(JsValue::from_f64(moved as f64))
+        })
+    }
+
     /// Verify the primary's pair-success container and add the device
     /// signature. Rejects with code "pairing_refused" and a `status`.
     #[wasm_bindgen(js_name = signPairing)]

@@ -274,8 +274,20 @@ fn forget_user_drops_every_device_of_that_user_only() {
     let records = Arc::new(MemoryRecordStore::new());
     let store = store_for(&records, "forget", "node-a", 0);
     let ops = block_on(SignalOps::create(store.clone())).unwrap();
-    let forgotten = ["123@c.us.0", "123:7@c.us.0", "123:12@c.us.0"];
-    let kept = ["1234@c.us.0", "1234:7@c.us.0", "123@lid.0", "123:7@lid.0"];
+    let forgotten = [
+        "123@c.us.0",
+        "123:7@c.us.0",
+        "123:12@c.us.0",
+        "123:99@hosted.0",
+    ];
+    let kept = [
+        "1234@c.us.0",
+        "1234:7@c.us.0",
+        "1234:99@hosted.0",
+        "123@lid.0",
+        "123:7@lid.0",
+        "123:99@hosted.lid.0",
+    ];
     // Stored addresses use WA Web's `c.us` server for phone-number users.
     for address in forgotten.iter().chain(&kept) {
         block_on(store.put_session(address, b"session")).unwrap();
@@ -307,4 +319,54 @@ fn forget_user_drops_every_device_of_that_user_only() {
     }
     // Nothing left to forget is not an error.
     block_on(ops.forget_user(&user)).unwrap();
+}
+
+#[test]
+fn migrate_pn_to_lid_moves_regular_and_hosted_devices() {
+    let records = Arc::new(MemoryRecordStore::new());
+    let store = store_for(&records, "migrate", "node-a", 0);
+    let ops = block_on(SignalOps::create(store.clone())).unwrap();
+    // Device 0 and the hosted device exist only under PN.
+    block_on(store.put_session("123@c.us.0", b"pn-0")).unwrap();
+    block_on(store.put_identity("123@c.us.0", [1; 32])).unwrap();
+    block_on(store.put_session("123:99@hosted.0", b"pn-hosted")).unwrap();
+    block_on(store.put_identity("123:99@hosted.0", [2; 32])).unwrap();
+    // Device 7 exists on both sides: PN session wins, LID identity wins.
+    block_on(store.put_session("123:7@c.us.0", b"pn-7")).unwrap();
+    block_on(store.put_identity("123:7@c.us.0", [3; 32])).unwrap();
+    block_on(store.put_session("456:7@lid.0", b"lid-7")).unwrap();
+    block_on(store.put_identity("456:7@lid.0", [4; 32])).unwrap();
+    // Another user sharing the prefix is untouched.
+    block_on(store.put_session("1234@c.us.0", b"other")).unwrap();
+
+    let pn: wacore_binary::Jid = "123@s.whatsapp.net".parse().unwrap();
+    let lid: wacore_binary::Jid = "456@lid".parse().unwrap();
+    assert_eq!(block_on(ops.migrate_pn_to_lid(&pn, &lid)).unwrap(), 3);
+
+    let session = |a: &str| block_on(store.get_session(a)).unwrap().map(|b| b.to_vec());
+    let identity = |a: &str| block_on(store.load_identity(a)).unwrap();
+    assert_eq!(session("456@lid.0").as_deref(), Some(&b"pn-0"[..]));
+    assert_eq!(identity("456@lid.0"), Some([1; 32]));
+    assert_eq!(
+        session("456:99@hosted.lid.0").as_deref(),
+        Some(&b"pn-hosted"[..])
+    );
+    assert_eq!(identity("456:99@hosted.lid.0"), Some([2; 32]));
+    assert_eq!(session("456:7@lid.0").as_deref(), Some(&b"pn-7"[..]));
+    assert_eq!(identity("456:7@lid.0"), Some([4; 32]));
+    for gone in ["123@c.us.0", "123:7@c.us.0", "123:99@hosted.0"] {
+        assert!(
+            session(gone).is_none() && identity(gone).is_none(),
+            "{gone}"
+        );
+    }
+    assert!(session("1234@c.us.0").is_some());
+
+    // Already migrated: nothing left to move.
+    assert_eq!(block_on(ops.migrate_pn_to_lid(&pn, &lid)).unwrap(), 0);
+    // Arguments the wrong way round are refused.
+    assert!(matches!(
+        block_on(ops.migrate_pn_to_lid(&lid, &pn)),
+        Err(OpsError::InvalidInput(_))
+    ));
 }
