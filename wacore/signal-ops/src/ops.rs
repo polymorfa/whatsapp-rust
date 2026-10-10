@@ -40,6 +40,9 @@ pub trait ServiceStore: SignalStore + Sized + 'static {
     async fn put_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()>;
     async fn delete_aux(&self, ns: Namespace, keys: &[&str]) -> StoreResult<()>;
     async fn scan_aux(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>>;
+    /// Addresses with a stored session ([`Namespace::Session`]) or identity
+    /// ([`Namespace::Identity`]) starting with `prefix`.
+    async fn scan_peer_addresses(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>>;
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -79,6 +82,10 @@ impl<R: RecordStore + 'static, S: Sealer + 'static> ServiceStore for RecordSigna
 
     async fn scan_aux(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>> {
         RecordSignalStore::scan_aux(self, ns, prefix, None).await
+    }
+
+    async fn scan_peer_addresses(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>> {
+        RecordSignalStore::scan_peer_addresses(self, ns, prefix, None).await
     }
 }
 
@@ -361,6 +368,55 @@ impl<S: ServiceStore> SignalOps<S> {
         let public = keys.public().signed_prekey;
         self.replace_keys(keys).await?;
         Ok(public)
+    }
+
+    /// Drop the stored identity and sessions of every device of `user`, after
+    /// the server reports that the user's identity changed. The next message
+    /// either way starts a fresh session. Sender keys are left alone: they are
+    /// replaced when the peer distributes a new one.
+    pub async fn forget_user(&self, user: &wacore_binary::Jid) -> Result<(), OpsError> {
+        use wacore::types::jid::JidExt;
+        let mut base = user.clone();
+        base.device = 0;
+        // `{user}@{server}` for device 0, `{user}:{device}@{server}` otherwise.
+        let primary = base.to_signal_address_string();
+        let server = &primary[user.user.len()..];
+        let belongs = |address: &str| {
+            let Some(rest) = address.strip_prefix(user.user.as_str()) else {
+                return false;
+            };
+            let rest = match rest.strip_prefix(':') {
+                Some(device) => match device.find('@') {
+                    Some(at) if device[..at].bytes().all(|b| b.is_ascii_digit()) => &device[at..],
+                    _ => return false,
+                },
+                None => rest,
+            };
+            rest.strip_prefix(server)
+                .is_some_and(|tail| tail.starts_with('.'))
+        };
+        let mut addresses = Vec::new();
+        for ns in [Namespace::Session, Namespace::Identity] {
+            for address in self.store.scan_peer_addresses(ns, &user.user).await? {
+                if belongs(&address) {
+                    addresses.push(address);
+                }
+            }
+        }
+        addresses.sort();
+        addresses.dedup();
+        if addresses.is_empty() {
+            return Ok(());
+        }
+        let _held = self
+            .lock_keys(addresses.iter().map(|a| format!("s:{a}")).collect())
+            .await;
+        let batch: Vec<Arc<str>> = addresses.iter().map(|a| Arc::from(a.as_str())).collect();
+        let staged = self.store.staged();
+        staged.delete_sessions_batch(&batch).await?;
+        staged.delete_identities_batch(&batch).await?;
+        staged.commit().await?;
+        Ok(())
     }
 
     pub async fn has_session(&self, address: &ProtocolAddress) -> Result<bool, OpsError> {

@@ -268,3 +268,43 @@ fn pairing_refuses_a_forged_container() {
     let refused = block_on(bob.ops.sign_pairing(b"not a pairing container"));
     assert!(matches!(refused, Err(OpsError::Pairing { .. })));
 }
+
+#[test]
+fn forget_user_drops_every_device_of_that_user_only() {
+    let records = Arc::new(MemoryRecordStore::new());
+    let store = store_for(&records, "forget", "node-a", 0);
+    let ops = block_on(SignalOps::create(store.clone())).unwrap();
+    let forgotten = ["123@c.us.0", "123:7@c.us.0", "123:12@c.us.0"];
+    let kept = ["1234@c.us.0", "1234:7@c.us.0", "123@lid.0", "123:7@lid.0"];
+    // Stored addresses use WA Web's `c.us` server for phone-number users.
+    for address in forgotten.iter().chain(&kept) {
+        block_on(store.put_session(address, b"session")).unwrap();
+        block_on(store.put_identity(address, [9; 32])).unwrap();
+    }
+
+    let user: wacore_binary::Jid = "123:7@s.whatsapp.net".parse().unwrap();
+    block_on(ops.forget_user(&user)).unwrap();
+
+    for address in forgotten {
+        assert!(
+            block_on(store.get_session(address)).unwrap().is_none(),
+            "{address}"
+        );
+        assert!(
+            block_on(store.load_identity(address)).unwrap().is_none(),
+            "{address}"
+        );
+    }
+    for address in kept {
+        assert!(
+            block_on(store.get_session(address)).unwrap().is_some(),
+            "{address}"
+        );
+        assert!(
+            block_on(store.load_identity(address)).unwrap().is_some(),
+            "{address}"
+        );
+    }
+    // Nothing left to forget is not an error.
+    block_on(ops.forget_user(&user)).unwrap();
+}

@@ -335,3 +335,15 @@ test("sends are built in the page and only ask the resolver for devices and keys
     (error) => error.code === "invalid_input",
   );
 });
+
+test("an identity change forgets every session with that user", async () => {
+  const alice = await device("alice-forget");
+  const bob = await device("bob-forget");
+  await alice.signal.establishSession(BOB, 1, await bundleFor(bob.signal));
+  assert.equal(await alice.signal.hasSession(BOB, 1), true);
+
+  await alice.signal.forgetUser(BOB);
+  assert.equal(await alice.signal.hasSession(BOB, 1), false);
+  await alice.signal.establishSession(BOB, 1, await bundleFor(bob.signal));
+  assert.equal(await alice.signal.hasSession(BOB, 1), true);
+});

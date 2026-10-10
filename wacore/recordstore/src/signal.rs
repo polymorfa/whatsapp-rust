@@ -335,6 +335,23 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
         self.scan(ns, prefix, limit).await
     }
 
+    /// Peer addresses with a stored session or identity, ascending. Only the
+    /// keys are read, so callers can find every device of a user.
+    pub async fn scan_peer_addresses(
+        &self,
+        ns: Namespace,
+        prefix: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        if !matches!(ns, Namespace::Session | Namespace::Identity) {
+            return Err(StoreError::Validation(format!(
+                "{} records do not hold peer addresses",
+                ns.tag()
+            )));
+        }
+        self.scan(ns, prefix, limit).await
+    }
+
     /// The local device's sealed key blob, if the scope has been initialised.
     pub async fn load_device(&self) -> Result<Option<Vec<u8>>> {
         self.load(Namespace::Device, DEVICE_KEY).await

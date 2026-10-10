@@ -599,6 +599,18 @@ impl SignalDevice {
         })
     }
 
+    /// Drop the identity and sessions of every device of a user whose
+    /// identity changed, as reported by the server.
+    #[wasm_bindgen(js_name = forgetUser)]
+    pub fn forget_user(&self, user: String) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let user = convert::jid(&user)?;
+            inner.ops.forget_user(&user).await.map_err(ops_error)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
     /// Verify the primary's pair-success container and add the device
     /// signature. Rejects with code "pairing_refused" and a `status`.
     #[wasm_bindgen(js_name = signPairing)]
