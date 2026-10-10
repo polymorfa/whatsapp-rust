@@ -13,16 +13,23 @@ pub enum Namespace {
     /// The local device's own keys (identity, registration ID, ADV secret,
     /// current signed prekey). Read and written whole by the Signal service.
     Device,
+    /// Decrypted results kept until the app confirms delivery, so a
+    /// redelivered ciphertext returns the same result instead of failing.
+    DecryptBuffer,
+    /// Messages this device sent, kept so a retry receipt can re-encrypt them.
+    SentMessage,
 }
 
 impl Namespace {
-    pub const ALL: [Namespace; 6] = [
+    pub const ALL: [Namespace; 8] = [
         Namespace::Identity,
         Namespace::Session,
         Namespace::PreKey,
         Namespace::SignedPreKey,
         Namespace::SenderKey,
         Namespace::Device,
+        Namespace::DecryptBuffer,
+        Namespace::SentMessage,
     ];
 
     /// Stable persisted name.
@@ -34,6 +41,8 @@ impl Namespace {
             Namespace::SignedPreKey => "signed_prekey",
             Namespace::SenderKey => "sender_key",
             Namespace::Device => "device",
+            Namespace::DecryptBuffer => "decrypt_buffer",
+            Namespace::SentMessage => "sent_message",
         }
     }
 }

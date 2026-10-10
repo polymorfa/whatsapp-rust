@@ -19,25 +19,59 @@ use wacore::libsignal::store::sender_key_name::SenderKeyName;
 use wacore::pair::PairUtils;
 use wacore::store::error::Result as StoreResult;
 use wacore::store::traits::SignalStore;
-use wacore_recordstore::{RecordSignalStore, RecordStore, Sealer};
+use wacore_recordstore::{Namespace, RecordSignalStore, RecordStore, Sealer};
 
-/// Persistence for the local device's key blob ([`DeviceKeys::encode`]).
+/// Storage the Signal service needs beyond [`SignalStore`]: the device key
+/// blob, its own records (decrypt buffer, sent messages), and staged views
+/// whose writes commit as one batch.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-pub trait DeviceKeyStore: Send + Sync {
+pub trait ServiceStore: SignalStore + Sized + 'static {
     async fn load_device_keys(&self) -> StoreResult<Option<Vec<u8>>>;
     async fn save_device_keys(&self, blob: &[u8]) -> StoreResult<()>;
+    /// A view whose writes are held until [`Self::commit`].
+    fn staged(&self) -> Self;
+    /// Apply a staged view's writes as one fenced batch.
+    async fn commit(&self) -> StoreResult<()>;
+    async fn load_aux(&self, ns: Namespace, key: &str) -> StoreResult<Option<Vec<u8>>>;
+    async fn put_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()>;
+    async fn delete_aux(&self, ns: Namespace, keys: &[&str]) -> StoreResult<()>;
+    async fn scan_aux(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>>;
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl<R: RecordStore, S: Sealer> DeviceKeyStore for RecordSignalStore<R, S> {
+impl<R: RecordStore + 'static, S: Sealer + 'static> ServiceStore for RecordSignalStore<R, S> {
     async fn load_device_keys(&self) -> StoreResult<Option<Vec<u8>>> {
         self.load_device().await
     }
 
     async fn save_device_keys(&self, blob: &[u8]) -> StoreResult<()> {
         self.save_device(blob).await
+    }
+
+    fn staged(&self) -> Self {
+        RecordSignalStore::staged(self)
+    }
+
+    async fn commit(&self) -> StoreResult<()> {
+        RecordSignalStore::commit(self).await
+    }
+
+    async fn load_aux(&self, ns: Namespace, key: &str) -> StoreResult<Option<Vec<u8>>> {
+        RecordSignalStore::load_aux(self, ns, key).await
+    }
+
+    async fn put_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()> {
+        RecordSignalStore::put_aux(self, ns, key, value).await
+    }
+
+    async fn delete_aux(&self, ns: Namespace, keys: &[&str]) -> StoreResult<()> {
+        RecordSignalStore::delete_aux(self, ns, keys).await
+    }
+
+    async fn scan_aux(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>> {
+        RecordSignalStore::scan_aux(self, ns, prefix, None).await
     }
 }
 
@@ -115,7 +149,7 @@ fn public_key(bytes: &[u8; 32], what: &str) -> Result<PublicKey, OpsError> {
         .map_err(|_| OpsError::InvalidInput(format!("{what} is not a valid public key")))
 }
 
-impl<S: SignalStore + DeviceKeyStore + 'static> SignalOps<S> {
+impl<S: ServiceStore> SignalOps<S> {
     /// Open a scope that already has device keys.
     pub async fn open(store: Arc<S>) -> Result<Self, OpsError> {
         let blob = store
@@ -149,11 +183,23 @@ impl<S: SignalStore + DeviceKeyStore + 'static> SignalOps<S> {
     }
 
     async fn stores(&self) -> Stores<S> {
+        self.stores_over(self.store.clone()).await
+    }
+
+    pub(crate) async fn stores_over(&self, store: Arc<S>) -> Stores<S> {
         Stores {
-            store: self.store.clone(),
+            store,
             keys: self.keys.read().await.clone(),
             sender_key_locks: self.sender_key_locks.clone(),
         }
+    }
+
+    pub(crate) fn store(&self) -> &Arc<S> {
+        &self.store
+    }
+
+    pub(crate) fn address_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        self.address_locks.get(key)
     }
 
     async fn replace_keys(&self, keys: DeviceKeys) -> Result<(), OpsError> {
@@ -282,7 +328,8 @@ impl<S: SignalStore + DeviceKeyStore + 'static> SignalOps<S> {
         Ok(())
     }
 
-    /// Decrypt one pairwise `<enc>` payload.
+    /// Decrypt one pairwise `<enc>` payload. The session update and the
+    /// consumed prekey's removal commit together.
     pub async fn decrypt(
         &self,
         sender: &ProtocolAddress,
@@ -291,7 +338,22 @@ impl<S: SignalStore + DeviceKeyStore + 'static> SignalOps<S> {
     ) -> Result<Decrypted, OpsError> {
         let lock = self.address_locks.get(sender.as_str());
         let _guard = lock.lock().await;
-        let mut sessions = self.stores().await;
+        let staged = Arc::new(self.store.staged());
+        let decrypted = self.decrypt_into(&staged, sender, kind, ciphertext).await?;
+        staged.commit().await?;
+        Ok(decrypted)
+    }
+
+    /// Decrypt into a staged view without committing it. The caller holds the
+    /// address lock and commits.
+    pub(crate) async fn decrypt_into(
+        &self,
+        staged: &Arc<S>,
+        sender: &ProtocolAddress,
+        kind: EncKind,
+        ciphertext: &[u8],
+    ) -> Result<Decrypted, OpsError> {
+        let mut sessions = self.stores_over(staged.clone()).await;
         let mut identities = sessions.clone();
         let result = match kind {
             EncKind::PreKey => {
@@ -316,10 +378,10 @@ impl<S: SignalStore + DeviceKeyStore + 'static> SignalOps<S> {
                     .await?
             }
         };
-        // The promoted session is already written; only now is it safe to
-        // delete the one-time prekey it consumed.
+        // Staged with the promoted session, so the prekey is never gone while
+        // the session that consumed it is not durable.
         if let Some(id) = result.consumed_prekey_id {
-            self.store.remove_prekey(id.into()).await?;
+            staged.remove_prekey(id.into()).await?;
         }
         Ok(Decrypted {
             plaintext: result.plaintext,
@@ -392,6 +454,34 @@ impl<S: SignalStore + DeviceKeyStore + 'static> SignalOps<S> {
         let name = SenderKeyName::from_parts(group, sender.as_str());
         let message = SenderKeyDistributionMessage::try_from(skdm)?;
         let mut store = self.stores().await;
+        process_sender_key_distribution_message(&name, &message, &mut store).await?;
+        Ok(())
+    }
+
+    /// Decrypt a group `skmsg` into a staged view without committing it.
+    pub(crate) async fn group_decrypt_into(
+        &self,
+        staged: &Arc<S>,
+        group: &str,
+        sender: &ProtocolAddress,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, OpsError> {
+        let name = SenderKeyName::from_parts(group, sender.as_str());
+        let mut store = self.stores_over(staged.clone()).await;
+        Ok(group_decrypt(ciphertext, &mut store, &name).await?)
+    }
+
+    /// Store a received sender key in a staged view without committing it.
+    pub(crate) async fn process_sender_key_distribution_into(
+        &self,
+        staged: &Arc<S>,
+        group: &str,
+        sender: &ProtocolAddress,
+        skdm: &[u8],
+    ) -> Result<(), OpsError> {
+        let name = SenderKeyName::from_parts(group, sender.as_str());
+        let message = SenderKeyDistributionMessage::try_from(skdm)?;
+        let mut store = self.stores_over(staged.clone()).await;
         process_sender_key_distribution_message(&name, &message, &mut store).await?;
         Ok(())
     }

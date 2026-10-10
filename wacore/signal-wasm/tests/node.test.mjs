@@ -237,3 +237,43 @@ test("pairing and input errors carry codes", async () => {
     (error) => error.code === "invalid_input",
   );
 });
+
+// A `waE2E.Message` with only `conversation` (field 1), padded as WhatsApp
+// pads (n bytes of value n, 1..=16).
+function paddedConversation(body) {
+  const utf8 = text(body);
+  const pad = 1 + (utf8.length % 16);
+  const out = new Uint8Array(2 + utf8.length + pad);
+  out[0] = 0x0a;
+  out[1] = utf8.length;
+  out.set(utf8, 2);
+  out.fill(pad, 2 + utf8.length);
+  return out;
+}
+
+function conversationOf(message) {
+  assert.equal(message[0], 0x0a);
+  return read(message.subarray(2, 2 + message[1]));
+}
+
+test("receive buffers until delivered and recognises redelivery after", async () => {
+  const alice = await device("alice-receive");
+  const bob = await device("bob-receive");
+  await alice.signal.establishSession(BOB, 1, await bundleFor(bob.signal));
+  const sent = await alice.signal.encrypt(BOB, 1, paddedConversation("hello from js"));
+  const args = [ALICE, ALICE, 1, sent.kind, sent.ciphertext, 2, false];
+
+  const first = await bob.signal.receive(...args);
+  assert.equal(first.status, "message");
+  assert.equal(first.redelivered, false);
+  assert.equal(conversationOf(first.message), "hello from js");
+
+  const again = await bob.signal.receive(...args);
+  assert.equal(again.redelivered, true);
+  assert.equal(again.receiptKey, first.receiptKey);
+
+  await bob.signal.markDelivered(first.receiptKey);
+  const after = await bob.signal.receive(...args);
+  assert.equal(after.status, "already_delivered");
+  assert.equal(bob.backend.containsBytes(text("hello from js")), false);
+});

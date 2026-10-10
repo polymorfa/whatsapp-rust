@@ -13,11 +13,13 @@
 
 mod device;
 mod error;
+mod inbound;
 mod ops;
 mod stores;
 
 pub use device::{DeviceKeys, PublicIdentity, PublicPreKey, PublicSignedPreKey};
 pub use error::OpsError;
+pub use inbound::{ReceiveKind, ReceiveRequest, Received, ReceivedMessage};
 pub use ops::{
-    Decrypted, DeviceKeyStore, EncKind, Encrypted, PairingSignature, RemoteBundle, SignalOps,
+    Decrypted, EncKind, Encrypted, PairingSignature, RemoteBundle, ServiceStore, SignalOps,
 };

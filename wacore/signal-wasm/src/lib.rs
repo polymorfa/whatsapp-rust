@@ -18,7 +18,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use wacore_recordstore::{Lease, LeaseStore, RecordSignalStore};
-use wacore_signal_ops::{EncKind, OpsError, SignalOps};
+use wacore_signal_ops::{EncKind, OpsError, ReceiveKind, ReceiveRequest, Received, SignalOps};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -355,6 +355,108 @@ impl SignalDevice {
                 .await
                 .map_err(ops_error)?;
             Ok(Uint8Array::from(plaintext.as_slice()).into())
+        })
+    }
+
+    /// Decrypt, buffer and classify one received payload. Resolves
+    /// `{ status: "message", receiptKey, message, isSkdmOnly, identityChanged,
+    /// redelivered }` where `message` is the encoded, unpadded `waE2E.Message`,
+    /// or `{ status: "already_delivered", receiptKey }`. Call `markDelivered`
+    /// once the app has stored the message.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive(
+        &self,
+        chat: String,
+        user: String,
+        device: u32,
+        kind: String,
+        ciphertext: Vec<u8>,
+        padding_version: u8,
+        is_from_me: bool,
+    ) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let kind = match kind.as_str() {
+                "pkmsg" => ReceiveKind::PreKey,
+                "msg" => ReceiveKind::Message,
+                "skmsg" => ReceiveKind::SenderKey,
+                other => {
+                    return Err(convert::coded_error(
+                        "invalid_input",
+                        &format!("unsupported enc type {other}"),
+                    ));
+                }
+            };
+            let sender = address(&user, device);
+            let received = inner
+                .ops
+                .receive(ReceiveRequest {
+                    chat: &chat,
+                    sender: &sender,
+                    kind,
+                    ciphertext: &ciphertext,
+                    padding_version,
+                    is_from_me,
+                })
+                .await
+                .map_err(ops_error)?;
+            let out = Object::new();
+            match received {
+                Received::AlreadyDelivered { receipt_key } => {
+                    set(&out, "status", &JsValue::from_str("already_delivered"));
+                    set(&out, "receiptKey", &JsValue::from_str(&receipt_key));
+                }
+                Received::Message(message) => {
+                    set(&out, "status", &JsValue::from_str("message"));
+                    set(&out, "receiptKey", &JsValue::from_str(&message.receipt_key));
+                    let encoded = waproto::codec::message_to_vec(&message.content.message);
+                    set(&out, "message", &Uint8Array::from(encoded.as_slice()));
+                    set(
+                        &out,
+                        "isSkdmOnly",
+                        &JsValue::from_bool(message.content.is_skdm_only),
+                    );
+                    set(
+                        &out,
+                        "identityChanged",
+                        &JsValue::from_bool(message.identity_changed),
+                    );
+                    set(
+                        &out,
+                        "redelivered",
+                        &JsValue::from_bool(message.redelivered),
+                    );
+                }
+            }
+            Ok(out.into())
+        })
+    }
+
+    /// Drop a delivered message's plaintext from the decrypt buffer.
+    #[wasm_bindgen(js_name = markDelivered)]
+    pub fn mark_delivered(&self, receipt_key: String) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            inner
+                .ops
+                .mark_delivered(&receipt_key)
+                .await
+                .map_err(ops_error)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    /// Delete decrypt-buffer entries older than `cutoffMs`; resolves the count.
+    #[wasm_bindgen(js_name = pruneDecryptBuffer)]
+    pub fn prune_decrypt_buffer(&self, cutoff_ms: f64) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let removed = inner
+                .ops
+                .prune_decrypt_buffer(cutoff_ms as u64)
+                .await
+                .map_err(ops_error)?;
+            Ok(JsValue::from_f64(removed as f64))
         })
     }
 

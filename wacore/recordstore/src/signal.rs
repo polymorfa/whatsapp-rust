@@ -2,7 +2,8 @@ use crate::record::{Fence, Namespace, RecordStore, WriteOp};
 use crate::seal::{SealError, Sealer};
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use wacore::store::error::{Result, StoreError};
 use wacore::store::traits::SignalStore;
 
@@ -13,12 +14,45 @@ const DEVICE_KEY: &str = "local";
 const PREKEY_NOT_UPLOADED: u8 = 0;
 const PREKEY_UPLOADED: u8 = 1;
 
+/// Namespaces the Signal service reads and writes directly, outside the
+/// [`SignalStore`] surface.
+const AUX_NAMESPACES: [Namespace; 3] = [
+    Namespace::Device,
+    Namespace::DecryptBuffer,
+    Namespace::SentMessage,
+];
+
+/// A write before sealing.
+#[derive(Debug, Clone)]
+enum PlainOp {
+    Put(Namespace, String, Vec<u8>),
+    Update(Namespace, String, Vec<u8>),
+    Delete(Namespace, String),
+}
+
+/// An uncommitted change held by a staged store.
+#[derive(Debug, Clone)]
+enum Staged {
+    Put(Vec<u8>),
+    /// Applied only if the key still exists when the batch commits.
+    Update(Vec<u8>),
+    Delete,
+}
+
+type Overlay = BTreeMap<(Namespace, String), Staged>;
+
 /// [`SignalStore`] for one scope, sealed by `S` and fenced by the lease that
 /// produced `fence`. Build a new one whenever the lease is re-acquired.
+///
+/// [`Self::staged`] returns a view whose writes stay in memory until
+/// [`Self::commit`] seals them and applies them as one fenced batch, so a
+/// decrypt's session update, consumed-prekey delete and buffered result land
+/// together or not at all.
 pub struct RecordSignalStore<R, S> {
     records: Arc<R>,
     sealer: Arc<S>,
     fence: Fence,
+    overlay: Option<Mutex<Overlay>>,
 }
 
 impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
@@ -27,11 +61,52 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
             records,
             sealer,
             fence,
+            overlay: None,
         }
     }
 
     pub fn fence(&self) -> &Fence {
         &self.fence
+    }
+
+    /// A view over the same scope whose writes are held until [`Self::commit`].
+    /// Reads see the view's own pending writes first.
+    pub fn staged(&self) -> Self {
+        Self {
+            records: self.records.clone(),
+            sealer: self.sealer.clone(),
+            fence: self.fence.clone(),
+            overlay: Some(Mutex::new(Overlay::new())),
+        }
+    }
+
+    /// Seal and apply every pending write of a staged view in one fenced
+    /// batch. Committing a view that is not staged is a no-op.
+    pub async fn commit(&self) -> Result<()> {
+        let pending = match &self.overlay {
+            Some(overlay) => std::mem::take(&mut *lock(overlay)?),
+            None => return Ok(()),
+        };
+        let mut ops = Vec::with_capacity(pending.len());
+        for ((ns, key), change) in pending {
+            ops.push(match change {
+                Staged::Put(plaintext) => WriteOp::Put {
+                    value: self.seal(ns, &key, &plaintext).await?,
+                    ns,
+                    key,
+                },
+                Staged::Update(plaintext) => WriteOp::Update {
+                    value: self.seal(ns, &key, &plaintext).await?,
+                    ns,
+                    key,
+                },
+                Staged::Delete => WriteOp::Delete { ns, key },
+            });
+        }
+        if ops.is_empty() {
+            return Ok(());
+        }
+        self.records.write(&self.fence, &ops).await
     }
 
     fn scope(&self) -> &str {
@@ -67,7 +142,20 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
             .map_err(seal_error)
     }
 
+    /// The staged change for one key, if this view holds one.
+    fn pending(&self, ns: Namespace, key: &str) -> Result<Option<Staged>> {
+        match &self.overlay {
+            Some(overlay) => Ok(lock(overlay)?.get(&(ns, key.to_owned())).cloned()),
+            None => Ok(None),
+        }
+    }
+
     async fn load(&self, ns: Namespace, key: &str) -> Result<Option<Vec<u8>>> {
+        match self.pending(ns, key)? {
+            Some(Staged::Put(v) | Staged::Update(v)) => return Ok(Some(v)),
+            Some(Staged::Delete) => return Ok(None),
+            None => {}
+        }
         match self.records.get(self.scope(), ns, key).await? {
             Some(sealed) => Ok(Some(self.open(ns, key, &sealed).await?)),
             None => Ok(None),
@@ -75,44 +163,155 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
     }
 
     async fn load_many(&self, ns: Namespace, keys: &[&str]) -> Result<Vec<(String, Vec<u8>)>> {
-        let found = self.records.get_many(self.scope(), ns, keys).await?;
-        let mut opened = Vec::with_capacity(found.len());
-        for (key, sealed) in found {
+        let mut opened = Vec::with_capacity(keys.len());
+        let mut from_store = Vec::with_capacity(keys.len());
+        for key in keys {
+            match self.pending(ns, key)? {
+                Some(Staged::Put(v) | Staged::Update(v)) => opened.push(((*key).to_owned(), v)),
+                Some(Staged::Delete) => {}
+                None => from_store.push(*key),
+            }
+        }
+        for (key, sealed) in self.records.get_many(self.scope(), ns, &from_store).await? {
             let plaintext = self.open(ns, &key, &sealed).await?;
             opened.push((key, plaintext));
         }
         Ok(opened)
     }
 
-    async fn put_op(&self, ns: Namespace, key: &str, plaintext: &[u8]) -> Result<WriteOp> {
-        Ok(WriteOp::Put {
-            ns,
-            key: key.to_owned(),
-            value: self.seal(ns, key, plaintext).await?,
+    /// Keys with `prefix`, ascending, including this view's pending changes.
+    async fn scan(&self, ns: Namespace, prefix: &str, limit: Option<usize>) -> Result<Vec<String>> {
+        let Some(overlay) = &self.overlay else {
+            return self
+                .records
+                .scan_keys(self.scope(), ns, prefix, limit)
+                .await;
+        };
+        // Pending deletes can hide stored keys, so scan without the limit.
+        let mut keys: std::collections::BTreeSet<String> = self
+            .records
+            .scan_keys(self.scope(), ns, prefix, None)
+            .await?
+            .into_iter()
+            .collect();
+        for ((pns, key), change) in lock(overlay)?.iter() {
+            if *pns != ns || !key.starts_with(prefix) {
+                continue;
+            }
+            match change {
+                Staged::Put(_) => {
+                    keys.insert(key.clone());
+                }
+                Staged::Delete => {
+                    keys.remove(key);
+                }
+                Staged::Update(_) => {}
+            }
+        }
+        let keys = keys.into_iter();
+        Ok(match limit {
+            Some(limit) => keys.take(limit).collect(),
+            None => keys.collect(),
         })
     }
 
-    async fn write(&self, ops: &[WriteOp]) -> Result<()> {
+    async fn apply(&self, ops: Vec<PlainOp>) -> Result<()> {
         if ops.is_empty() {
             return Ok(());
         }
-        self.records.write(&self.fence, ops).await
+        if let Some(overlay) = &self.overlay {
+            let mut overlay = lock(overlay)?;
+            for op in ops {
+                let (slot, change) = match op {
+                    PlainOp::Put(ns, key, v) => ((ns, key), Staged::Put(v)),
+                    PlainOp::Update(ns, key, v) => {
+                        // Updating a key this view already wrote keeps it a Put.
+                        let staged = match overlay.get(&(ns, key.clone())) {
+                            Some(Staged::Put(_)) => Staged::Put(v),
+                            Some(Staged::Delete) => continue,
+                            _ => Staged::Update(v),
+                        };
+                        ((ns, key), staged)
+                    }
+                    PlainOp::Delete(ns, key) => ((ns, key), Staged::Delete),
+                };
+                overlay.insert(slot, change);
+            }
+            return Ok(());
+        }
+        let mut sealed = Vec::with_capacity(ops.len());
+        for op in ops {
+            sealed.push(match op {
+                PlainOp::Put(ns, key, v) => WriteOp::Put {
+                    value: self.seal(ns, &key, &v).await?,
+                    ns,
+                    key,
+                },
+                PlainOp::Update(ns, key, v) => WriteOp::Update {
+                    value: self.seal(ns, &key, &v).await?,
+                    ns,
+                    key,
+                },
+                PlainOp::Delete(ns, key) => WriteOp::Delete { ns, key },
+            });
+        }
+        self.records.write(&self.fence, &sealed).await
     }
 
     async fn put_one(&self, ns: Namespace, key: &str, plaintext: &[u8]) -> Result<()> {
-        let op = self.put_op(ns, key, plaintext).await?;
-        self.write(std::slice::from_ref(&op)).await
+        self.apply(vec![PlainOp::Put(ns, key.to_owned(), plaintext.to_vec())])
+            .await
     }
 
     async fn delete_keys<K: AsRef<str>>(&self, ns: Namespace, keys: &[K]) -> Result<()> {
-        let ops: Vec<_> = keys
-            .iter()
-            .map(|key| WriteOp::Delete {
-                ns,
-                key: key.as_ref().to_owned(),
-            })
-            .collect();
-        self.write(&ops).await
+        self.apply(
+            keys.iter()
+                .map(|key| PlainOp::Delete(ns, key.as_ref().to_owned()))
+                .collect(),
+        )
+        .await
+    }
+
+    fn check_aux(ns: Namespace) -> Result<()> {
+        if AUX_NAMESPACES.contains(&ns) {
+            Ok(())
+        } else {
+            Err(StoreError::Validation(format!(
+                "{} records are only reachable through SignalStore",
+                ns.tag()
+            )))
+        }
+    }
+
+    /// Read a record in one of the service's own namespaces
+    /// ([`Namespace::Device`], [`Namespace::DecryptBuffer`],
+    /// [`Namespace::SentMessage`]).
+    pub async fn load_aux(&self, ns: Namespace, key: &str) -> Result<Option<Vec<u8>>> {
+        Self::check_aux(ns)?;
+        self.load(ns, key).await
+    }
+
+    /// Write a record in one of the service's own namespaces.
+    pub async fn put_aux(&self, ns: Namespace, key: &str, plaintext: &[u8]) -> Result<()> {
+        Self::check_aux(ns)?;
+        self.put_one(ns, key, plaintext).await
+    }
+
+    /// Delete records in one of the service's own namespaces.
+    pub async fn delete_aux(&self, ns: Namespace, keys: &[&str]) -> Result<()> {
+        Self::check_aux(ns)?;
+        self.delete_keys(ns, keys).await
+    }
+
+    /// Keys in one of the service's own namespaces, ascending.
+    pub async fn scan_aux(
+        &self,
+        ns: Namespace,
+        prefix: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        Self::check_aux(ns)?;
+        self.scan(ns, prefix, limit).await
     }
 
     /// The local device's sealed key blob, if the scope has been initialised.
@@ -126,12 +325,14 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
     }
 
     async fn any_key_with_prefix(&self, ns: Namespace, prefix: &str) -> Result<bool> {
-        Ok(!self
-            .records
-            .scan_keys(self.scope(), ns, prefix, Some(1))
-            .await?
-            .is_empty())
+        Ok(!self.scan(ns, prefix, Some(1)).await?.is_empty())
     }
+}
+
+fn lock(overlay: &Mutex<Overlay>) -> Result<MutexGuard<'_, Overlay>> {
+    overlay
+        .lock()
+        .map_err(|_| StoreError::Validation("staged record view lock poisoned".into()))
 }
 
 fn seal_error(error: SealError) -> StoreError {
@@ -183,11 +384,13 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
     }
 
     async fn put_identities_batch(&self, identities: &[(Arc<str>, [u8; 32])]) -> Result<()> {
-        let mut ops = Vec::with_capacity(identities.len());
-        for (address, key) in identities {
-            ops.push(self.put_op(Namespace::Identity, address, key).await?);
-        }
-        self.write(&ops).await
+        self.apply(
+            identities
+                .iter()
+                .map(|(a, k)| PlainOp::Put(Namespace::Identity, a.to_string(), k.to_vec()))
+                .collect(),
+        )
+        .await
     }
 
     async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>> {
@@ -217,11 +420,13 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
     }
 
     async fn put_sessions_batch(&self, sessions: &[(Arc<str>, Bytes)]) -> Result<()> {
-        let mut ops = Vec::with_capacity(sessions.len());
-        for (address, session) in sessions {
-            ops.push(self.put_op(Namespace::Session, address, session).await?);
-        }
-        self.write(&ops).await
+        self.apply(
+            sessions
+                .iter()
+                .map(|(a, s)| PlainOp::Put(Namespace::Session, a.to_string(), s.to_vec()))
+                .collect(),
+        )
+        .await
     }
 
     async fn get_sessions_batch(&self, addresses: &[Arc<str>]) -> Result<Vec<(Arc<str>, Bytes)>> {
@@ -250,11 +455,15 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
     }
 
     async fn has_session(&self, address: &str) -> Result<bool> {
-        Ok(self
-            .records
-            .get(self.scope(), Namespace::Session, address)
-            .await?
-            .is_some())
+        match self.pending(Namespace::Session, address)? {
+            Some(Staged::Delete) => Ok(false),
+            Some(_) => Ok(true),
+            None => Ok(self
+                .records
+                .get(self.scope(), Namespace::Session, address)
+                .await?
+                .is_some()),
+        }
     }
 
     async fn has_signal_state_for_user(&self, user: &str) -> Result<bool> {
@@ -272,21 +481,27 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
     }
 
     async fn store_prekey(&self, id: u32, record: &[u8], uploaded: bool) -> Result<()> {
-        let key = id_key(id);
-        self.put_one(Namespace::PreKey, &key, &prekey_plaintext(record, uploaded))
-            .await
+        self.put_one(
+            Namespace::PreKey,
+            &id_key(id),
+            &prekey_plaintext(record, uploaded),
+        )
+        .await
     }
 
     async fn store_prekeys_batch(&self, keys: &[(u32, Bytes)], uploaded: bool) -> Result<()> {
-        let mut ops = Vec::with_capacity(keys.len());
-        for (id, record) in keys {
-            let key = id_key(*id);
-            ops.push(
-                self.put_op(Namespace::PreKey, &key, &prekey_plaintext(record, uploaded))
-                    .await?,
-            );
-        }
-        self.write(&ops).await
+        self.apply(
+            keys.iter()
+                .map(|(id, r)| {
+                    PlainOp::Put(
+                        Namespace::PreKey,
+                        id_key(*id),
+                        prekey_plaintext(r, uploaded),
+                    )
+                })
+                .collect(),
+        )
+        .await
     }
 
     async fn load_prekey(&self, id: u32) -> Result<Option<Bytes>> {
@@ -312,18 +527,15 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
         let mut ops = Vec::with_capacity(ids.len());
         for (key, plaintext) in self.load_many(Namespace::PreKey, &key_refs).await? {
             let record = prekey_record(plaintext)?;
-            let value = self
-                .seal(Namespace::PreKey, &key, &prekey_plaintext(&record, true))
-                .await?;
             // Update, not Put: a key consumed after the read above stays
             // deleted instead of being resurrected by this write.
-            ops.push(WriteOp::Update {
-                ns: Namespace::PreKey,
+            ops.push(PlainOp::Update(
+                Namespace::PreKey,
                 key,
-                value,
-            });
+                prekey_plaintext(&record, true),
+            ));
         }
-        self.write(&ops).await
+        self.apply(ops).await
     }
 
     async fn remove_prekey(&self, id: u32) -> Result<()> {
@@ -336,10 +548,7 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
     }
 
     async fn get_max_prekey_id(&self) -> Result<u32> {
-        let keys = self
-            .records
-            .scan_keys(self.scope(), Namespace::PreKey, "", None)
-            .await?;
+        let keys = self.scan(Namespace::PreKey, "", None).await?;
         keys.last().map_or(Ok(0), |key| parse_id(key))
     }
 
@@ -353,10 +562,7 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
     }
 
     async fn load_all_signed_prekeys(&self) -> Result<Vec<(u32, Vec<u8>)>> {
-        let keys = self
-            .records
-            .scan_keys(self.scope(), Namespace::SignedPreKey, "", None)
-            .await?;
+        let keys = self.scan(Namespace::SignedPreKey, "", None).await?;
         let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
         let mut result = Vec::with_capacity(keys.len());
         for (key, plaintext) in self.load_many(Namespace::SignedPreKey, &key_refs).await? {
@@ -376,11 +582,13 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
     }
 
     async fn put_sender_keys_batch(&self, sender_keys: &[(Arc<str>, Bytes)]) -> Result<()> {
-        let mut ops = Vec::with_capacity(sender_keys.len());
-        for (address, record) in sender_keys {
-            ops.push(self.put_op(Namespace::SenderKey, address, record).await?);
-        }
-        self.write(&ops).await
+        self.apply(
+            sender_keys
+                .iter()
+                .map(|(a, r)| PlainOp::Put(Namespace::SenderKey, a.to_string(), r.to_vec()))
+                .collect(),
+        )
+        .await
     }
 
     async fn get_sender_key(&self, address: &str) -> Result<Option<Vec<u8>>> {
@@ -435,6 +643,87 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!raw.windows(16).any(|w| w == b"identity-private"));
+    }
+
+    #[test]
+    fn staged_writes_stay_private_until_commit() {
+        let (records, store) = setup();
+        block_on(store.put_session("keep@s.whatsapp.net", b"old")).unwrap();
+        block_on(store.store_prekey(5, b"five", false)).unwrap();
+
+        let staged = store.staged();
+        block_on(staged.put_session("keep@s.whatsapp.net", b"new")).unwrap();
+        block_on(staged.put_session("fresh@s.whatsapp.net", b"s")).unwrap();
+        block_on(staged.remove_prekey(5)).unwrap();
+        block_on(staged.put_aux(Namespace::DecryptBuffer, "h1", b"result")).unwrap();
+
+        // The view reads its own writes.
+        assert_eq!(
+            block_on(staged.get_session("keep@s.whatsapp.net"))
+                .unwrap()
+                .as_deref(),
+            Some(&b"new"[..])
+        );
+        assert_eq!(block_on(staged.load_prekey(5)).unwrap(), None);
+        assert_eq!(block_on(staged.get_max_prekey_id()).unwrap(), 0);
+        assert!(block_on(staged.has_signal_state_for_user("fresh")).unwrap());
+
+        // Nothing reached the store yet.
+        assert_eq!(
+            block_on(store.get_session("keep@s.whatsapp.net"))
+                .unwrap()
+                .as_deref(),
+            Some(&b"old"[..])
+        );
+        assert!(
+            block_on(records.get("device-1", Namespace::DecryptBuffer, "h1"))
+                .unwrap()
+                .is_none()
+        );
+
+        block_on(staged.commit()).unwrap();
+        assert_eq!(
+            block_on(store.get_session("keep@s.whatsapp.net"))
+                .unwrap()
+                .as_deref(),
+            Some(&b"new"[..])
+        );
+        assert_eq!(block_on(store.load_prekey(5)).unwrap(), None);
+        assert_eq!(
+            block_on(store.load_aux(Namespace::DecryptBuffer, "h1"))
+                .unwrap()
+                .as_deref(),
+            Some(&b"result"[..])
+        );
+    }
+
+    #[test]
+    fn a_stale_staged_commit_applies_nothing() {
+        let (records, store) = setup();
+        let staged = store.staged();
+        block_on(staged.put_session("a@s.whatsapp.net", b"s")).unwrap();
+        block_on(records.acquire("device-1", "node-b", TTL, TTL))
+            .unwrap()
+            .unwrap();
+        let err = block_on(staged.commit()).unwrap_err();
+        assert!(is_fence_lost(&err));
+        assert!(
+            block_on(records.get("device-1", Namespace::Session, "a@s.whatsapp.net"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn signal_namespaces_are_not_reachable_through_the_aux_api() {
+        let (_, store) = setup();
+        assert!(block_on(store.put_aux(Namespace::Session, "x", b"v")).is_err());
+        assert!(block_on(store.load_aux(Namespace::Identity, "x")).is_err());
+        block_on(store.put_aux(Namespace::SentMessage, "chat\0id", b"m")).unwrap();
+        assert_eq!(
+            block_on(store.scan_aux(Namespace::SentMessage, "chat", None)).unwrap(),
+            vec!["chat\0id".to_owned()]
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ wacore-recordstore = { path = "../recordstore" }
 wacore-signal-ops = { path = "../signal-ops" }
 wasm-bindgen = "0.2.128"
 wasm-bindgen-futures = "0.4"
+waproto = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }
