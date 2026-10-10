@@ -512,7 +512,25 @@ impl<S: ServiceStore> SignalOps<S> {
         let OwnIdentity { account, .. } = self.own_identity().await?;
         let address = request.encryption_jid.to_protocol_address();
 
-        let _held = self.lock_keys(vec![session_key(&address)]).await;
+        // A group retry also means the requester may have lost this device's
+        // sender key: forget its mark so the next group send redistributes it,
+        // as WA Web and the client do (mark_requester_for_fresh_skdm).
+        let mut held_keys = vec![session_key(&address)];
+        if matches!(request.route, RetryRoute::Group { .. }) {
+            held_keys.push(group_key(&request.chat.to_string()));
+        }
+        let _held = self.lock_keys(held_keys).await;
+        if matches!(request.route, RetryRoute::Group { .. }) {
+            let group = request.chat.to_string();
+            let keys: Vec<String> = [request.requester, request.encryption_jid]
+                .into_iter()
+                .map(|jid| sender_key_device_key(&group, jid))
+                .collect();
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            self.store()
+                .delete_aux(Namespace::SenderKeyDevices, &refs)
+                .await?;
+        }
         let staged = std::sync::Arc::new(self.store().staged());
         if let Some(bundle) = request.bundle {
             self.establish_into(&staged, &address, bundle).await?;

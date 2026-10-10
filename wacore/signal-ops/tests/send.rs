@@ -345,6 +345,35 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
         Some("second")
     );
 
+    // A retry receipt from Bob in the group makes the next send redistribute.
+    common::pair(&alice).await;
+    alice
+        .resend(
+            &client,
+            wacore_signal_ops::RetryRequest {
+                chat: &group,
+                message_id: "G2",
+                requester: &bob_jid,
+                encryption_jid: &bob_jid,
+                route: wacore_signal_ops::RetryRoute::Group {
+                    addressing_mode: AddressingMode::Pn,
+                },
+                retry_count: 1,
+                bundle: None,
+            },
+        )
+        .await
+        .unwrap();
+    let after_retry = alice
+        .send_group(&TokioRuntime, &client, &group, &text("after retry"), "G2b")
+        .await
+        .unwrap();
+    assert_eq!(after_retry.distribution_targets, vec![bob_jid.clone()]);
+    alice
+        .mark_sender_key_distributed(&group, &after_retry.distribution_targets)
+        .await
+        .unwrap();
+
     alice.forget_sender_key_devices(&group).await.unwrap();
     let third = alice
         .send_group(&TokioRuntime, &client, &group, &text("third"), "G3")
