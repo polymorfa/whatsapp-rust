@@ -5324,6 +5324,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "wacore-recordstore"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm 0.11.1",
+ "async-trait",
+ "bytes",
+ "futures",
+ "rand 0.10.3",
+ "thiserror 2.0.21",
+ "wacore",
+]
+
+[[package]]
+name = "wacore-signal-ops"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-lock",
+ "async-trait",
+ "buffa",
+ "bytes",
+ "futures",
+ "hex",
+ "hmac 0.13.0",
+ "rand 0.10.3",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+ "tokio",
+ "wacore",
+ "wacore-binary",
+ "wacore-recordstore",
+ "waproto",
+]
+
+[[package]]
+name = "wacore-signal-wasm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "getrandom 0.4.3",
+ "js-sys",
+ "send_wrapper",
+ "wacore",
+ "wacore-binary",
+ "wacore-recordstore",
+ "wacore-signal-ops",
+ "waproto",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
 name = "wait-timeout"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5392,6 +5445,16 @@ dependencies = [
  "rustversion",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
+]
+
+[[package]]
+name = "wasm-bindgen-futures"
+version = "0.4.78"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ef4c5d3d2cdf5c54f4231181768f5510842e350db025faf1f7163b1030ed928"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]
