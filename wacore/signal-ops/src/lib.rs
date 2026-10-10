@@ -24,4 +24,4 @@ pub use inbound::{ReceiveKind, ReceiveRequest, Received, ReceivedMessage};
 pub use ops::{
     Decrypted, EncKind, Encrypted, PairingSignature, RemoteBundle, ServiceStore, SignalOps,
 };
-pub use outbound::{PreparedGroupSend, PreparedSend};
+pub use outbound::{PreparedGroupSend, PreparedSend, RetryRequest, RetryRoute};

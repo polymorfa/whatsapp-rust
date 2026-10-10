@@ -14,6 +14,7 @@ use wacore::runtime::{AbortHandle, Runtime};
 use wacore::types::jid::JidExt as _;
 use wacore_binary::{Jid, NodeContent};
 use wacore_recordstore::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
+mod common;
 use wacore_signal_ops::{ReceiveKind, ReceiveRequest, Received, SignalOps};
 use waproto::whatsapp as wa;
 
@@ -346,4 +347,143 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
         .await
         .unwrap();
     assert_eq!(third.distribution_targets, vec![bob_jid.clone()]);
+}
+
+/// The first `<enc>` anywhere in the stanza.
+fn first_enc(stanza: &[u8]) -> (String, u8, Vec<u8>) {
+    fn find(node: &wacore_binary::Node) -> Option<&wacore_binary::Node> {
+        if node.tag == "enc" {
+            return Some(node);
+        }
+        node.children()?.iter().find_map(find)
+    }
+    enc_parts(find(&parse(stanza)).expect("enc"))
+}
+
+fn remote_bundle_from(bundle: &PreKeyBundle) -> wacore_signal_ops::RemoteBundle {
+    let key = |k: &PublicKey| -> [u8; 32] { k.public_key_bytes().try_into().unwrap() };
+    wacore_signal_ops::RemoteBundle {
+        registration_id: bundle.registration_id().unwrap(),
+        device_id: bundle.device_id().unwrap().into(),
+        identity_key: key(bundle.identity_key().unwrap().public_key()),
+        signed_prekey_id: bundle.signed_pre_key_id().unwrap().into(),
+        signed_prekey: key(&bundle.signed_pre_key_public().unwrap()),
+        signed_prekey_signature: bundle
+            .signed_pre_key_signature()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        prekey: bundle
+            .pre_key_id()
+            .unwrap()
+            .map(|id| (id.into(), key(&bundle.pre_key_public().unwrap().unwrap()))),
+    }
+}
+
+/// Decrypt the first `<enc>` of a stanza from `from` and return its text.
+async fn deliver(ops: &SignalOps<Store>, from: &Jid, stanza: Vec<u8>) -> Option<String> {
+    let (kind, version, ciphertext) = first_enc(&stanza);
+    let sender = from.to_protocol_address();
+    let chat = from.to_non_ad().to_string();
+    let received = ops
+        .receive(ReceiveRequest {
+            chat: &chat,
+            sender: &sender,
+            kind: if kind == "pkmsg" {
+                ReceiveKind::PreKey
+            } else {
+                ReceiveKind::Message
+            },
+            ciphertext: &ciphertext,
+            padding_version: version,
+            is_from_me: false,
+        })
+        .await
+        .unwrap();
+    let Received::Message(message) = received else {
+        panic!("expected a message")
+    };
+    message.content.message.conversation
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_receipt_gets_the_message_re_encrypted() {
+    use wacore_signal_ops::{RetryRequest, RetryRoute};
+
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    let bob_jid: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    let alice = device("alice-retry", "111:1@s.whatsapp.net").await;
+    // A retry pkmsg must carry the device identity, which pairing provides.
+    common::pair(&alice).await;
+    let bob = device("bob-retry", "222:1@s.whatsapp.net").await;
+    let client = FakeClient {
+        devices: vec![bob_jid.clone()],
+        bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+        group: None,
+    };
+    let to = bob_jid.to_non_ad();
+    // Bob never processes the original.
+    alice
+        .send_direct(&TokioRuntime, &client, &to, &text("lost once"), "R1")
+        .await
+        .unwrap();
+
+    let retried = alice
+        .resend(
+            &client,
+            RetryRequest {
+                chat: &to,
+                message_id: "R1",
+                requester: &bob_jid,
+                encryption_jid: &bob_jid,
+                route: RetryRoute::Direct { recipient: None },
+                retry_count: 1,
+                bundle: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deliver(&bob, &alice_jid, retried).await.as_deref(),
+        Some("lost once")
+    );
+
+    // Bob's device was reset: new keys arrive with the next retry receipt.
+    let fresh_bob = device("bob-retry-fresh", "222:1@s.whatsapp.net").await;
+    let fresh_bundle = remote_bundle_from(&bundle_for(&fresh_bob).await);
+    let retried = alice
+        .resend(
+            &client,
+            RetryRequest {
+                chat: &to,
+                message_id: "R1",
+                requester: &bob_jid,
+                encryption_jid: &bob_jid,
+                route: RetryRoute::Direct { recipient: None },
+                retry_count: 2,
+                bundle: Some(&fresh_bundle),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        deliver(&fresh_bob, &alice_jid, retried).await.as_deref(),
+        Some("lost once")
+    );
+
+    let unknown = alice
+        .resend(
+            &client,
+            RetryRequest {
+                chat: &to,
+                message_id: "NOPE",
+                requester: &bob_jid,
+                encryption_jid: &bob_jid,
+                route: RetryRoute::Direct { recipient: None },
+                retry_count: 1,
+                bundle: None,
+            },
+        )
+        .await;
+    assert!(unknown.is_err());
 }

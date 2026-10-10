@@ -9,9 +9,11 @@
 //! before ciphertext is published.
 
 use crate::error::OpsError;
+use crate::ops::RemoteBundle;
 use crate::ops::{ServiceStore, SignalOps};
 use std::collections::HashSet;
 use wacore::client::context::SendContextResolver;
+use wacore::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
 use wacore::libsignal::store::sender_key_name::SenderKeyName;
 use wacore::runtime::Runtime;
 use wacore::send::{
@@ -19,8 +21,9 @@ use wacore::send::{
     SenderKeyDistributionPolicy, SignalStores, prepare_dm_stanza, prepare_group_stanza,
     retain_skdm_distribution_targets,
 };
+use wacore::send::{PairwiseRetryDestination, PairwiseRetryRequest, prepare_pairwise_retry_stanza};
 use wacore::types::jid::JidExt as _;
-use wacore::types::message::AddressingMode;
+use wacore::types::message::{AddressingMode, EditAttribute};
 use wacore_binary::{Jid, JidExt};
 use wacore_recordstore::Namespace;
 use waproto::whatsapp as wa;
@@ -70,6 +73,36 @@ pub struct PreparedGroupSend {
     /// the client should refresh their device lists.
     pub stale_device_users: Vec<String>,
     pub phash: Option<String>,
+}
+
+/// Where a retried message goes, matching the client's retransmission routes.
+#[derive(Debug, Clone)]
+pub enum RetryRoute {
+    /// A direct message; `recipient` is the original chat user when the
+    /// requester is one of this account's own devices.
+    Direct {
+        recipient: Option<Jid>,
+    },
+    Group {
+        addressing_mode: AddressingMode,
+    },
+    BroadcastList,
+}
+
+/// A retry receipt the client received for a message this device sent.
+#[derive(Debug, Clone)]
+pub struct RetryRequest<'a> {
+    /// The chat the original went to (the recipient user, group or list).
+    pub chat: &'a Jid,
+    pub message_id: &'a str,
+    /// The device that asked, as addressed on the wire.
+    pub requester: &'a Jid,
+    /// The address to encrypt to (the requester's LID when known).
+    pub encryption_jid: &'a Jid,
+    pub route: RetryRoute,
+    pub retry_count: u8,
+    /// Keys the receipt carried, used to start a fresh session.
+    pub bundle: Option<&'a RemoteBundle>,
 }
 
 struct OwnIdentity {
@@ -422,5 +455,85 @@ impl<S: ServiceStore> SignalOps<S> {
             .delete_aux(Namespace::SenderKeyDevices, &refs)
             .await?;
         Ok(())
+    }
+
+    /// Re-encrypt a sent message for the device that asked for it. Without a
+    /// session and without keys in the receipt, a bundle is fetched through
+    /// the resolver, as the client does. Status messages are not handled here.
+    pub async fn resend(
+        &self,
+        resolver: &dyn SendContextResolver,
+        request: RetryRequest<'_>,
+    ) -> Result<Vec<u8>, OpsError> {
+        let message = self
+            .sent_message(request.chat, request.message_id)
+            .await?
+            .ok_or_else(|| OpsError::InvalidInput("no record of that sent message".into()))?;
+        let OwnIdentity { account, .. } = self.own_identity().await?;
+        let address = request.encryption_jid.to_protocol_address();
+
+        let lock = self.session_lock();
+        let _guard = lock.lock().await;
+        let staged = std::sync::Arc::new(self.store().staged());
+        if let Some(bundle) = request.bundle {
+            self.establish_into(&staged, &address, bundle).await?;
+        } else if !staged.has_session(address.as_str()).await? {
+            let fetched = resolver
+                .fetch_prekeys(std::slice::from_ref(request.encryption_jid))
+                .await
+                .map_err(send_error)?;
+            let bundle = fetched.get(request.encryption_jid).ok_or_else(|| {
+                OpsError::Send("no session and no prekey bundle for the requester".into())
+            })?;
+            let mut sessions = self.stores_over(staged.clone()).await;
+            let mut identities = sessions.clone();
+            process_prekey_bundle(
+                &address,
+                &mut sessions,
+                &mut identities,
+                bundle,
+                &mut rand::make_rng::<rand::rngs::StdRng>(),
+                UsePQRatchet::No,
+            )
+            .await?;
+        }
+
+        let destination = match request.route {
+            RetryRoute::Direct { recipient } => PairwiseRetryDestination::Direct {
+                to: request.requester.clone(),
+                recipient,
+            },
+            RetryRoute::Group { addressing_mode } => PairwiseRetryDestination::Participant {
+                to: request.chat.clone(),
+                participant: request.requester.clone(),
+                addressing_mode: Some(addressing_mode),
+            },
+            RetryRoute::BroadcastList => PairwiseRetryDestination::Participant {
+                to: request.chat.clone(),
+                participant: request.requester.clone(),
+                addressing_mode: None,
+            },
+        };
+        let mut sessions = self.stores_over(staged.clone()).await;
+        let mut identities = sessions.clone();
+        let node = prepare_pairwise_retry_stanza(
+            &mut sessions,
+            &mut identities,
+            PairwiseRetryRequest {
+                destination,
+                encryption_jid: request.encryption_jid.clone(),
+                message: &message,
+                message_id: request.message_id.to_owned(),
+                retry_count: request.retry_count,
+                account: account.as_ref(),
+                edit: EditAttribute::infer_from_message(&message),
+                pre_encoded: None,
+            },
+        )
+        .await
+        .map_err(send_error)?;
+        staged.commit().await?;
+        wacore_binary::marshal(&node)
+            .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))
     }
 }

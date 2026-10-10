@@ -321,6 +321,20 @@ impl<S: ServiceStore> SignalOps<S> {
     ) -> Result<(), OpsError> {
         let lock = self.session_lock.clone();
         let _guard = lock.lock().await;
+        let staged = Arc::new(self.store.staged());
+        self.establish_into(&staged, address, bundle).await?;
+        staged.commit().await?;
+        Ok(())
+    }
+
+    /// X3DH into a staged view without committing it. The caller holds the
+    /// session lock and commits.
+    pub(crate) async fn establish_into(
+        &self,
+        staged: &Arc<S>,
+        address: &ProtocolAddress,
+        bundle: &RemoteBundle,
+    ) -> Result<(), OpsError> {
         let prekey = match bundle.prekey {
             Some((id, key)) => Some((id.into(), public_key(&key, "prekey")?)),
             None => None,
@@ -334,7 +348,7 @@ impl<S: ServiceStore> SignalOps<S> {
             bundle.signed_prekey_signature,
             IdentityKey::new(public_key(&bundle.identity_key, "identity key")?),
         )?;
-        let mut sessions = self.stores().await;
+        let mut sessions = self.stores_over(staged.clone()).await;
         let mut identities = sessions.clone();
         process_prekey_bundle(
             address,
