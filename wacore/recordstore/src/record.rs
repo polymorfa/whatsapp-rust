@@ -84,6 +84,13 @@ pub enum WriteOp {
     },
     /// Remove; a missing key is a no-op.
     Delete { ns: Namespace, key: String },
+    /// Insert only if the key is absent. If it exists, the whole batch fails
+    /// with [`RecordExists`] and nothing is applied.
+    Insert {
+        ns: Namespace,
+        key: String,
+        value: Vec<u8>,
+    },
 }
 
 /// The write was refused because `fence` no longer matches the scope's lease.
@@ -98,6 +105,32 @@ impl FenceLost {
     pub fn into_store_error(self) -> StoreError {
         StoreError::Database(Box::new(self))
     }
+}
+
+/// An [`WriteOp::Insert`] found its key already present; nothing was applied.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{ns:?} record {key} already exists")]
+pub struct RecordExists {
+    pub ns: Namespace,
+    pub key: String,
+}
+
+impl RecordExists {
+    pub fn into_store_error(self) -> StoreError {
+        StoreError::Database(Box::new(self))
+    }
+}
+
+/// Whether `error` (or any error it wraps) is a [`RecordExists`].
+pub fn is_record_exists(error: &StoreError) -> bool {
+    let mut layer: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(current) = layer {
+        if current.is::<RecordExists>() {
+            return true;
+        }
+        layer = current.source();
+    }
+    false
 }
 
 /// Whether `error` (or any error it wraps) is a [`FenceLost`]. A node that
@@ -146,7 +179,8 @@ pub trait RecordStore: Send + Sync {
 
     /// Apply every op or none, and only while `fence.generation` is the
     /// scope's current lease generation. Otherwise return
-    /// [`FenceLost::into_store_error`] and apply nothing.
+    /// [`FenceLost::into_store_error`] and apply nothing. An `Insert` whose key
+    /// exists fails the batch with [`RecordExists::into_store_error`].
     async fn write(&self, fence: &Fence, ops: &[WriteOp]) -> Result<()>;
 }
 

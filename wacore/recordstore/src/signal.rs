@@ -27,6 +27,7 @@ const AUX_NAMESPACES: [Namespace; 4] = [
 #[derive(Debug, Clone)]
 enum PlainOp {
     Put(Namespace, String, Vec<u8>),
+    Insert(Namespace, String, Vec<u8>),
     Update(Namespace, String, Vec<u8>),
     Delete(Namespace, String),
 }
@@ -35,6 +36,8 @@ enum PlainOp {
 #[derive(Debug, Clone)]
 enum Staged {
     Put(Vec<u8>),
+    /// Applied only if the key is still absent when the batch commits.
+    Insert(Vec<u8>),
     /// Applied only if the key still exists when the batch commits.
     Update(Vec<u8>),
     Delete,
@@ -96,6 +99,11 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
                     ns,
                     key,
                 },
+                Staged::Insert(plaintext) => WriteOp::Insert {
+                    value: self.seal(ns, &key, &plaintext).await?,
+                    ns,
+                    key,
+                },
                 Staged::Update(plaintext) => WriteOp::Update {
                     value: self.seal(ns, &key, &plaintext).await?,
                     ns,
@@ -114,18 +122,21 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
         &self.fence.scope
     }
 
+    /// Authenticated data binding a value to its slot. Every component is
+    /// length-prefixed so no two (scope, namespace, key) triples encode alike;
+    /// scopes and keys may contain any byte, including NUL.
     fn aad(&self, ns: Namespace, key: &str) -> Vec<u8> {
-        let scope = self.scope().as_bytes();
-        let tag = ns.tag().as_bytes();
         let mut aad =
-            Vec::with_capacity(AAD_DOMAIN.len() + scope.len() + tag.len() + key.len() + 3);
-        aad.extend_from_slice(AAD_DOMAIN);
-        aad.push(0);
-        aad.extend_from_slice(scope);
-        aad.push(0);
-        aad.extend_from_slice(tag);
-        aad.push(0);
-        aad.extend_from_slice(key.as_bytes());
+            Vec::with_capacity(AAD_DOMAIN.len() + 12 + self.scope().len() + key.len() + 16);
+        for part in [
+            AAD_DOMAIN,
+            self.scope().as_bytes(),
+            ns.tag().as_bytes(),
+            key.as_bytes(),
+        ] {
+            aad.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            aad.extend_from_slice(part);
+        }
         aad
     }
 
@@ -153,7 +164,7 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
 
     async fn load(&self, ns: Namespace, key: &str) -> Result<Option<Vec<u8>>> {
         match self.pending(ns, key)? {
-            Some(Staged::Put(v) | Staged::Update(v)) => return Ok(Some(v)),
+            Some(Staged::Put(v) | Staged::Update(v) | Staged::Insert(v)) => return Ok(Some(v)),
             Some(Staged::Delete) => return Ok(None),
             None => {}
         }
@@ -168,7 +179,9 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
         let mut from_store = Vec::with_capacity(keys.len());
         for key in keys {
             match self.pending(ns, key)? {
-                Some(Staged::Put(v) | Staged::Update(v)) => opened.push(((*key).to_owned(), v)),
+                Some(Staged::Put(v) | Staged::Update(v) | Staged::Insert(v)) => {
+                    opened.push(((*key).to_owned(), v))
+                }
                 Some(Staged::Delete) => {}
                 None => from_store.push(*key),
             }
@@ -200,7 +213,7 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
                 continue;
             }
             match change {
-                Staged::Put(_) => {
+                Staged::Put(_) | Staged::Insert(_) => {
                     keys.insert(key.clone());
                 }
                 Staged::Delete => {
@@ -225,10 +238,12 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
             for op in ops {
                 let (slot, change) = match op {
                     PlainOp::Put(ns, key, v) => ((ns, key), Staged::Put(v)),
+                    PlainOp::Insert(ns, key, v) => ((ns, key), Staged::Insert(v)),
                     PlainOp::Update(ns, key, v) => {
                         // Updating a key this view already wrote keeps it a Put.
                         let staged = match overlay.get(&(ns, key.clone())) {
                             Some(Staged::Put(_)) => Staged::Put(v),
+                            Some(Staged::Insert(_)) => Staged::Insert(v),
                             Some(Staged::Delete) => continue,
                             _ => Staged::Update(v),
                         };
@@ -244,6 +259,11 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
         for op in ops {
             sealed.push(match op {
                 PlainOp::Put(ns, key, v) => WriteOp::Put {
+                    value: self.seal(ns, &key, &v).await?,
+                    ns,
+                    key,
+                },
+                PlainOp::Insert(ns, key, v) => WriteOp::Insert {
                     value: self.seal(ns, &key, &v).await?,
                     ns,
                     key,
@@ -318,6 +338,18 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
     /// The local device's sealed key blob, if the scope has been initialised.
     pub async fn load_device(&self) -> Result<Option<Vec<u8>>> {
         self.load(Namespace::Device, DEVICE_KEY).await
+    }
+
+    /// Write the local device's first key blob. Fails with
+    /// [`crate::RecordExists`] if the scope already has one, so two concurrent
+    /// initialisers cannot both succeed.
+    pub async fn create_device(&self, blob: &[u8]) -> Result<()> {
+        self.apply(vec![PlainOp::Insert(
+            Namespace::Device,
+            DEVICE_KEY.to_owned(),
+            blob.to_vec(),
+        )])
+        .await
     }
 
     /// Replace the local device's key blob, fenced like every other write.
@@ -724,6 +756,22 @@ mod tests {
         assert_eq!(
             block_on(store.scan_aux(Namespace::SentMessage, "chat", None)).unwrap(),
             vec!["chat\0id".to_owned()]
+        );
+    }
+
+    #[test]
+    fn slots_with_shifted_separators_get_distinct_aad() {
+        let records = Arc::new(MemoryRecordStore::new());
+        let sealer = Arc::new(AesGcmSealer::new(&[3; 32]));
+        let fence = |scope: &str| Fence {
+            scope: Arc::from(scope),
+            generation: 1,
+        };
+        let a = RecordSignalStore::new(records.clone(), sealer.clone(), fence("a"));
+        let b = RecordSignalStore::new(records, sealer, fence("a\0session\0b"));
+        assert_ne!(
+            a.aad(Namespace::Session, "b\0session\0c"),
+            b.aad(Namespace::Session, "c")
         );
     }
 

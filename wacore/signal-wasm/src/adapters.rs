@@ -10,7 +10,7 @@ use js_sys::{Array, Object, Promise, Reflect, Uint8Array};
 use send_wrapper::SendWrapper;
 use wacore::store::error::{Result, StoreError};
 use wacore_recordstore::{
-    Fence, FenceLost, Lease, LeaseStore, Namespace, RecordStore, SealError, WriteOp,
+    Fence, FenceLost, Lease, LeaseStore, Namespace, RecordExists, RecordStore, SealError, WriteOp,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -103,11 +103,10 @@ fn describe(error: &JsValue) -> String {
         .unwrap_or_else(|| "JavaScript error".to_owned())
 }
 
-fn is_fence_lost(error: &JsValue) -> bool {
+fn error_code(error: &JsValue) -> Option<String> {
     Reflect::get(error, &JsValue::from_str("code"))
         .ok()
         .and_then(|c| c.as_string())
-        .is_some_and(|c| c == "fence_lost")
 }
 
 fn store_error(error: JsValue) -> StoreError {
@@ -134,6 +133,7 @@ fn op_to_js(op: &WriteOp) -> JsValue {
         WriteOp::Put { ns, key, value } => ("put", ns, key, Some(value)),
         WriteOp::Update { ns, key, value } => ("update", ns, key, Some(value)),
         WriteOp::Delete { ns, key } => ("delete", ns, key, None),
+        WriteOp::Insert { ns, key, value } => ("insert", ns, key, Some(value)),
     };
     crate::convert::set(&out, "op", &JsValue::from_str(kind));
     crate::convert::set(&out, "ns", &JsValue::from_str(ns.tag()));
@@ -205,16 +205,25 @@ impl RecordStore for JsRecords {
         settle(self.0.write(fence_to_js(fence), list))
             .await
             .map(|_| ())
-            .map_err(|error| {
-                if is_fence_lost(&error) {
-                    FenceLost {
-                        scope: fence.scope.clone(),
-                        generation: fence.generation,
-                    }
-                    .into_store_error()
-                } else {
-                    store_error(error)
+            .map_err(|error| match error_code(&error).as_deref() {
+                Some("fence_lost") => FenceLost {
+                    scope: fence.scope.clone(),
+                    generation: fence.generation,
                 }
+                .into_store_error(),
+                Some("record_exists") => {
+                    // The backend does not say which insert collided; report the
+                    // first one in the batch.
+                    let (ns, key) = ops
+                        .iter()
+                        .find_map(|op| match op {
+                            WriteOp::Insert { ns, key, .. } => Some((*ns, key.clone())),
+                            _ => None,
+                        })
+                        .unwrap_or((Namespace::Device, String::new()));
+                    RecordExists { ns, key }.into_store_error()
+                }
+                _ => store_error(error),
             })
     }
 }

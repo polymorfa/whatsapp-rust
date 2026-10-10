@@ -51,8 +51,13 @@ class MemoryBackend {
       throw Object.assign(new Error("fence lost"), { code: "fence_lost" });
     }
     for (const op of ops) {
+      if (op.op === "insert" && this.records.has(this.#slot(fence.scope, op.ns, op.key))) {
+        throw Object.assign(new Error("record exists"), { code: "record_exists" });
+      }
+    }
+    for (const op of ops) {
       const slot = this.#slot(fence.scope, op.ns, op.key);
-      if (op.op === "put") this.records.set(slot, op.value.slice());
+      if (op.op === "put" || op.op === "insert") this.records.set(slot, op.value.slice());
       else if (op.op === "update") {
         if (this.records.has(slot)) this.records.set(slot, op.value.slice());
       } else this.records.delete(slot);
@@ -213,13 +218,16 @@ test("group messages decrypt with a distributed sender key", async () => {
   assert.equal(read(await bob.signal.groupDecrypt(group, ALICE, 1, skmsg)), "hello group");
 });
 
-test("a sealer with the wrong key cannot open the device", async () => {
+test("a sealer with the wrong key cannot open the device, and the lease is released", async () => {
   const backend = new MemoryBackend();
-  await device("bob-key", { backend });
+  const first = await device("bob-key", { backend });
+  await first.signal.release();
   await assert.rejects(
-    SignalDevice.open(backend, await webCryptoSealer(), "bob-key", "tab-a", 1, TTL, false),
+    SignalDevice.open(backend, await webCryptoSealer(), "bob-key", "tab-b", 1, TTL, false),
     (error) => error.code === "store",
   );
+  // The failed open gave its lease back, so another tab can take the scope.
+  await SignalDevice.open(backend, first.sealer, "bob-key", "tab-c", 2, TTL, false);
 });
 
 test("pairing and input errors carry codes", async () => {

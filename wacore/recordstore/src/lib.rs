@@ -29,7 +29,8 @@ pub mod conformance;
 
 pub use memory::MemoryRecordStore;
 pub use record::{
-    Fence, FenceLost, Lease, LeaseStore, Namespace, RecordStore, WriteOp, is_fence_lost,
+    Fence, FenceLost, Lease, LeaseStore, Namespace, RecordExists, RecordStore, WriteOp,
+    is_fence_lost, is_record_exists,
 };
 pub use seal::{AesGcmSealer, SealError, Sealer};
 pub use signal::RecordSignalStore;

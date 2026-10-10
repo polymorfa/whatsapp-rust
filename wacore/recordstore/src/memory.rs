@@ -1,4 +1,6 @@
-use crate::record::{Fence, FenceLost, Lease, LeaseStore, Namespace, RecordStore, WriteOp};
+use crate::record::{
+    Fence, FenceLost, Lease, LeaseStore, Namespace, RecordExists, RecordStore, WriteOp,
+};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -83,8 +85,21 @@ impl RecordStore for MemoryRecordStore {
         }
         // Validation happens before any mutation, so the batch stays atomic.
         for op in ops {
+            if let WriteOp::Insert { ns, key, .. } = op
+                && state
+                    .records
+                    .contains_key(&(fence.scope.clone(), *ns, key.clone()))
+            {
+                return Err(RecordExists {
+                    ns: *ns,
+                    key: key.clone(),
+                }
+                .into_store_error());
+            }
+        }
+        for op in ops {
             match op {
-                WriteOp::Put { ns, key, value } => {
+                WriteOp::Put { ns, key, value } | WriteOp::Insert { ns, key, value } => {
                     state
                         .records
                         .insert((fence.scope.clone(), *ns, key.clone()), value.clone());

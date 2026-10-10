@@ -29,6 +29,9 @@ use wacore_recordstore::{Namespace, RecordSignalStore, RecordStore, Sealer};
 pub trait ServiceStore: SignalStore + Sized + 'static {
     async fn load_device_keys(&self) -> StoreResult<Option<Vec<u8>>>;
     async fn save_device_keys(&self, blob: &[u8]) -> StoreResult<()>;
+    /// Write the first device key blob; fails with `RecordExists` if one is
+    /// already stored.
+    async fn create_device_keys(&self, blob: &[u8]) -> StoreResult<()>;
     /// A view whose writes are held until [`Self::commit`].
     fn staged(&self) -> Self;
     /// Apply a staged view's writes as one fenced batch.
@@ -48,6 +51,10 @@ impl<R: RecordStore + 'static, S: Sealer + 'static> ServiceStore for RecordSigna
 
     async fn save_device_keys(&self, blob: &[u8]) -> StoreResult<()> {
         self.save_device(blob).await
+    }
+
+    async fn create_device_keys(&self, blob: &[u8]) -> StoreResult<()> {
+        self.create_device(blob).await
     }
 
     fn staged(&self) -> Self {
@@ -146,18 +153,38 @@ pub struct PairingSignature {
     pub key_index: u32,
 }
 
+/// Locks held by one operation.
+pub(crate) type Held = Vec<async_lock::MutexGuardArc<()>>;
+
+/// Lock key for one peer device's session and identity.
+pub(crate) fn session_key(address: &ProtocolAddress) -> String {
+    format!("s:{}", address.as_str())
+}
+
+/// Lock key for one sender-key chain.
+pub(crate) fn chain_key(group: &str, sender: &str) -> String {
+    format!("k:{group}\u{0}{sender}")
+}
+
+/// Lock key for a group's sender-key distribution marks.
+pub(crate) fn group_key(group: &str) -> String {
+    format!("g:{group}")
+}
+
 /// Signal operations for one scope (one linked device).
 ///
-/// Every operation that changes Signal state holds one lock per device:
-/// staged views commit whole batches, so two concurrent views writing the
-/// same session would lose a ratchet step. The store's lease fencing protects
-/// against a second node.
+/// Every operation that changes Signal state first locks exactly the state it
+/// can write: a peer's session, a sender-key chain, or a group's distribution
+/// marks. Staged views commit whole batches, so two views writing the same
+/// record would lose an update; disjoint views proceed in parallel. Locks are
+/// taken in sorted order, so overlapping operations cannot deadlock. The
+/// store's lease fencing protects against a second node.
 pub struct SignalOps<S> {
     store: Arc<S>,
     keys: RwLock<Arc<DeviceKeys>>,
     /// Held while device keys are read-modify-written.
     device_write: Mutex<()>,
-    session_lock: Arc<Mutex<()>>,
+    locks: Arc<KeyedLocks>,
     sender_key_locks: Arc<KeyedLocks>,
 }
 
@@ -181,16 +208,17 @@ impl<S: ServiceStore> SignalOps<S> {
     }
 
     /// Generate and persist device keys for a new scope. Refuses to replace
-    /// existing keys: that would silently unlink the device.
+    /// existing keys, which would silently unlink the device; the write is an
+    /// exclusive insert, so concurrent initialisers cannot both succeed.
     pub async fn create(store: Arc<S>) -> Result<Self, OpsError> {
-        if store.load_device_keys().await?.is_some() {
-            return Err(OpsError::InvalidInput(
-                "scope already has device keys".into(),
-            ));
-        }
         let keys = DeviceKeys::generate()?;
-        store.save_device_keys(&keys.encode()).await?;
-        Ok(Self::with_keys(store, keys))
+        match store.create_device_keys(&keys.encode()).await {
+            Ok(()) => Ok(Self::with_keys(store, keys)),
+            Err(e) if wacore_recordstore::is_record_exists(&e) => Err(OpsError::InvalidInput(
+                "scope already has device keys".into(),
+            )),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn with_keys(store: Arc<S>, keys: DeviceKeys) -> Self {
@@ -198,7 +226,7 @@ impl<S: ServiceStore> SignalOps<S> {
             store,
             keys: RwLock::new(Arc::new(keys)),
             device_write: Mutex::new(()),
-            session_lock: Arc::new(Mutex::new(())),
+            locks: Arc::new(KeyedLocks::default()),
             sender_key_locks: Arc::new(KeyedLocks::default()),
         }
     }
@@ -219,8 +247,16 @@ impl<S: ServiceStore> SignalOps<S> {
         &self.store
     }
 
-    pub(crate) fn session_lock(&self) -> Arc<Mutex<()>> {
-        self.session_lock.clone()
+    /// Lock every key, in sorted order. Hold the result for the duration of
+    /// the operation.
+    pub(crate) async fn lock_keys(&self, mut keys: Vec<String>) -> Held {
+        keys.sort();
+        keys.dedup();
+        let mut held = Vec::with_capacity(keys.len());
+        for key in keys {
+            held.push(self.locks.get(&key).lock_arc().await);
+        }
+        held
     }
 
     pub(crate) async fn keys(&self) -> Arc<DeviceKeys> {
@@ -338,8 +374,7 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
-        let lock = self.session_lock.clone();
-        let _guard = lock.lock().await;
+        let _held = self.lock_keys(vec![session_key(address)]).await;
         let staged = Arc::new(self.store.staged());
         self.establish_into(&staged, address, bundle).await?;
         staged.commit().await?;
@@ -377,8 +412,7 @@ impl<S: ServiceStore> SignalOps<S> {
         kind: EncKind,
         ciphertext: &[u8],
     ) -> Result<Decrypted, OpsError> {
-        let lock = self.session_lock.clone();
-        let _guard = lock.lock().await;
+        let _held = self.lock_keys(vec![session_key(sender)]).await;
         let staged = Arc::new(self.store.staged());
         let decrypted = self.decrypt_into(&staged, sender, kind, ciphertext).await?;
         staged.commit().await?;
@@ -439,8 +473,7 @@ impl<S: ServiceStore> SignalOps<S> {
         recipient: &ProtocolAddress,
         plaintext: &[u8],
     ) -> Result<Encrypted, OpsError> {
-        let lock = self.session_lock.clone();
-        let _guard = lock.lock().await;
+        let _held = self.lock_keys(vec![session_key(recipient)]).await;
         let mut sessions = self.stores().await;
         let mut identities = sessions.clone();
         let message = message_encrypt(plaintext, recipient, &mut sessions, &mut identities).await?;
@@ -467,8 +500,9 @@ impl<S: ServiceStore> SignalOps<S> {
         own_address: &ProtocolAddress,
     ) -> Result<Vec<u8>, OpsError> {
         let name = SenderKeyName::from_parts(group, own_address.as_str());
-        let lock = self.session_lock.clone();
-        let _guard = lock.lock().await;
+        let _held = self
+            .lock_keys(vec![chain_key(group, own_address.as_str())])
+            .await;
         let mut store = self.stores().await;
         let skdm = create_sender_key_distribution_message(&name, &mut store, &mut rng()).await?;
         Ok(skdm.serialized().to_vec())
@@ -482,8 +516,9 @@ impl<S: ServiceStore> SignalOps<S> {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, OpsError> {
         let name = SenderKeyName::from_parts(group, own_address.as_str());
-        let lock = self.session_lock.clone();
-        let _guard = lock.lock().await;
+        let _held = self
+            .lock_keys(vec![chain_key(group, own_address.as_str())])
+            .await;
         let mut store = self.stores().await;
         let message = group_encrypt(&mut store, &name, plaintext, &mut rng()).await?;
         Ok(message.serialized().to_vec())
@@ -498,6 +533,9 @@ impl<S: ServiceStore> SignalOps<S> {
     ) -> Result<(), OpsError> {
         let name = SenderKeyName::from_parts(group, sender.as_str());
         let message = SenderKeyDistributionMessage::try_from(skdm)?;
+        let _held = self
+            .lock_keys(vec![chain_key(group, sender.as_str())])
+            .await;
         let mut store = self.stores().await;
         process_sender_key_distribution_message(&name, &message, &mut store).await?;
         Ok(())
@@ -539,8 +577,9 @@ impl<S: ServiceStore> SignalOps<S> {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, OpsError> {
         let name = SenderKeyName::from_parts(group, sender.as_str());
-        let lock = self.session_lock.clone();
-        let _guard = lock.lock().await;
+        let _held = self
+            .lock_keys(vec![chain_key(group, sender.as_str())])
+            .await;
         let mut store = self.stores().await;
         Ok(group_decrypt(ciphertext, &mut store, &name).await?)
     }

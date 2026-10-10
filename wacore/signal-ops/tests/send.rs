@@ -226,6 +226,10 @@ async fn a_stanza_built_by_the_service_decrypts_at_the_recipient() {
         let kept = alice.sent_message(&to, &id).await.unwrap().unwrap();
         assert_eq!(kept.conversation.as_deref(), Some(body));
     }
+
+    assert_eq!(alice.prune_sent_messages(0).await.unwrap(), 0);
+    assert_eq!(alice.prune_sent_messages(u64::MAX).await.unwrap(), 2);
+    assert!(alice.sent_message(&to, "MSG0").await.unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -486,4 +490,98 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
         )
         .await;
     assert!(unknown.is_err());
+}
+
+/// Holds every prekey fetch until released, like a slow peer lookup.
+struct SlowClient {
+    inner: FakeClient,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl SendContextResolver for SlowClient {
+    async fn resolve_devices(&self, jids: &[Jid]) -> Result<Vec<Jid>, anyhow::Error> {
+        self.inner.resolve_devices(jids).await
+    }
+
+    async fn fetch_prekeys(
+        &self,
+        jids: &[Jid],
+    ) -> Result<HashMap<Jid, PreKeyBundle>, anyhow::Error> {
+        self.gate.notified().await;
+        self.inner.fetch_prekeys(jids).await
+    }
+
+    async fn fetch_prekeys_for_identity_check(
+        &self,
+        jids: &[Jid],
+    ) -> Result<PreKeyFetchOutcome, anyhow::Error> {
+        Ok(PreKeyFetchOutcome {
+            bundles: self.fetch_prekeys(jids).await?,
+            rejected: Vec::new(),
+        })
+    }
+
+    async fn resolve_group_routing_info(
+        &self,
+        jid: &Jid,
+    ) -> Result<Arc<GroupRoutingInfo>, anyhow::Error> {
+        self.inner.resolve_group_routing_info(jid).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_send_does_not_block_receiving_from_another_peer() {
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    let carol_jid: Jid = "333:1@s.whatsapp.net".parse().unwrap();
+    let dave_jid: Jid = "444:1@s.whatsapp.net".parse().unwrap();
+    let alice = device("alice-slow", "111:1@s.whatsapp.net").await;
+    let carol = device("carol-slow", "333:1@s.whatsapp.net").await;
+    let dave = Arc::new(device("dave-slow", "444:1@s.whatsapp.net").await);
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let slow = Arc::new(SlowClient {
+        inner: FakeClient {
+            devices: vec![carol_jid.clone()],
+            bundles: HashMap::from([(carol_jid.clone(), bundle_for(&carol).await)]),
+            group: None,
+        },
+        gate: gate.clone(),
+    });
+    let send = {
+        let dave = dave.clone();
+        let slow = slow.clone();
+        let to = carol_jid.to_non_ad();
+        tokio::spawn(async move {
+            dave.send_direct(&TokioRuntime, slow.as_ref(), &to, &text("to carol"), "S1")
+                .await
+        })
+    };
+
+    // Alice writes to Dave while Dave's send is stuck fetching Carol's keys.
+    let to_dave = FakeClient {
+        devices: vec![dave_jid.clone()],
+        bundles: HashMap::from([(dave_jid.clone(), bundle_for(&dave).await)]),
+        group: None,
+    };
+    let sent = alice
+        .send_direct(
+            &TokioRuntime,
+            &to_dave,
+            &dave_jid.to_non_ad(),
+            &text("to dave"),
+            "A1",
+        )
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(
+        Duration::from_secs(5),
+        deliver(&dave, &alice_jid, sent.stanza),
+    )
+    .await
+    .expect("receive was blocked by an unrelated send");
+    assert_eq!(received.as_deref(), Some("to dave"));
+
+    gate.notify_one();
+    send.await.unwrap().unwrap();
 }

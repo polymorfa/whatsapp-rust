@@ -10,16 +10,16 @@
 
 use crate::error::OpsError;
 use crate::ops::RemoteBundle;
-use crate::ops::{ServiceStore, SignalOps};
+use crate::ops::{ServiceStore, SignalOps, chain_key, group_key, session_key};
 use std::collections::HashSet;
 use wacore::client::context::SendContextResolver;
 use wacore::libsignal::protocol::{UsePQRatchet, process_prekey_bundle};
 use wacore::libsignal::store::sender_key_name::SenderKeyName;
 use wacore::runtime::Runtime;
 use wacore::send::{
-    DmStanzaRequest, GroupStanzaRequest, ResolvedDmDevices, ResolvedGroupDevices,
-    SenderKeyDistributionPolicy, SignalStores, prepare_dm_stanza, prepare_group_stanza,
-    retain_skdm_distribution_targets,
+    DmSignalAddressing, DmStanzaRequest, GroupStanzaRequest, ResolvedDmDevices,
+    ResolvedGroupDevices, SenderKeyDistributionPolicy, SignalStores, prepare_dm_stanza,
+    prepare_group_stanza, retain_skdm_distribution_targets,
 };
 use wacore::send::{PairwiseRetryDestination, PairwiseRetryRequest, prepare_pairwise_retry_stanza};
 use wacore::types::jid::JidExt as _;
@@ -44,9 +44,12 @@ fn sent_key(chat: &Jid, message_id: &str) -> String {
     format!("{chat}\u{0}{message_id}")
 }
 
-/// Sent-message record: `[has_secret][secret (32 bytes, when set)][message]`.
+/// Sent-message record: `[inserted ms, u64 BE][has_secret][secret (32 bytes,
+/// when set)][message]`.
 fn encode_sent(message: &[u8], secret: Option<&[u8; 32]>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 32 + message.len());
+    let inserted_ms = u64::try_from(wacore::time::now_utc().timestamp_millis()).unwrap_or(0);
+    let mut out = Vec::with_capacity(8 + 1 + 32 + message.len());
+    out.extend_from_slice(&inserted_ms.to_be_bytes());
     match secret {
         Some(secret) => {
             out.push(1);
@@ -56,6 +59,19 @@ fn encode_sent(message: &[u8], secret: Option<&[u8; 32]>) -> Vec<u8> {
     }
     out.extend_from_slice(message);
     out
+}
+
+/// `(inserted ms, message bytes)` of a sent-message record.
+fn decode_sent(record: &[u8]) -> Result<(u64, &[u8]), OpsError> {
+    let corrupt = || OpsError::InvalidInput("sent-message record is corrupt".into());
+    let (inserted, rest) = record.split_at_checked(8).ok_or_else(corrupt)?;
+    let inserted_ms = u64::from_be_bytes(inserted.try_into().map_err(|_| corrupt())?);
+    let body = match rest.first() {
+        Some(0) => &rest[1..],
+        Some(1) if rest.len() >= 33 => &rest[33..],
+        _ => return Err(corrupt()),
+    };
+    Ok((inserted_ms, body))
 }
 
 fn send_error(error: anyhow::Error) -> OpsError {
@@ -109,6 +125,18 @@ struct OwnIdentity {
     pn: Jid,
     lid: Option<Jid>,
     account: Option<wa::ADVSignedDeviceIdentity>,
+}
+
+/// The address a device is encrypted to: its LID when the client knows the
+/// mapping for a phone-number device, otherwise the device itself.
+async fn encryption_jid(resolver: &dyn SendContextResolver, device: &Jid) -> Jid {
+    if device.is_pn()
+        && let Some(lid_user) = resolver.get_lid_for_phone(&device.user).await
+        && let Ok(lid) = format!("{lid_user}@lid").parse::<Jid>()
+    {
+        return lid.with_device(device.device);
+    }
+    device.clone()
 }
 
 fn sender_key_device_key(group: &str, device: &Jid) -> String {
@@ -167,8 +195,21 @@ impl<S: ServiceStore> SignalOps<S> {
         wacore::types::jid::sort_dedup_by_device(&mut devices);
         let resolved = ResolvedDmDevices::new(devices, &own_jid, own_lid.as_ref());
 
-        let lock = self.session_lock();
-        let _guard = lock.lock().await;
+        // Fix each device's Signal address up front (its LID when the client
+        // knows one, as wacore's fan-out would) so the locks taken here cover
+        // exactly the sessions the encrypt will write.
+        let mut encryption = Vec::with_capacity(resolved.devices().len());
+        for device in resolved.devices() {
+            encryption.push(encryption_jid(resolver, device).await);
+        }
+        let held_keys: Vec<String> = encryption
+            .iter()
+            .map(|jid| session_key(&jid.to_protocol_address()))
+            .collect();
+        let mut lock_jids = encryption.clone();
+        lock_jids.sort_by_key(|jid| jid.to_protocol_address().as_str().to_owned());
+        let _ = resolved.signal_addressing_or_init(DmSignalAddressing::new(encryption, lock_jids));
+        let _held = self.lock_keys(held_keys).await;
         let staged = std::sync::Arc::new(self.store().staged());
         let stores = self.stores_over(staged.clone()).await;
         let (mut sender_keys, mut sessions, mut identities, mut prekeys, signed_prekeys) = (
@@ -238,15 +279,7 @@ impl<S: ServiceStore> SignalOps<S> {
         else {
             return Ok(None);
         };
-        let body = match record.first() {
-            Some(0) => &record[1..],
-            Some(1) if record.len() >= 33 => &record[33..],
-            _ => {
-                return Err(OpsError::InvalidInput(
-                    "sent-message record is corrupt".into(),
-                ));
-            }
-        };
+        let (_, body) = decode_sent(&record)?;
         waproto::codec::message_decode(body)
             .map(Some)
             .map_err(|e| OpsError::InvalidInput(format!("sent message did not decode: {e}")))
@@ -314,8 +347,17 @@ impl<S: ServiceStore> SignalOps<S> {
         let addressed = ResolvedGroupDevices::new(devices);
 
         let group_str = group.to_string();
-        let lock = self.session_lock();
-        let _guard = lock.lock().await;
+        let mut held_keys = vec![
+            chain_key(&group_str, own_sending.to_protocol_address().as_str()),
+            group_key(&group_str),
+        ];
+        for device in addressed.devices() {
+            held_keys.push(session_key(&device.to_protocol_address()));
+            held_keys.push(session_key(
+                &encryption_jid(resolver, device).await.to_protocol_address(),
+            ));
+        }
+        let _held = self.lock_keys(held_keys).await;
         let own_chain =
             SenderKeyName::from_parts(&group_str, own_sending.to_protocol_address().as_str());
         // A missing chain means a fresh key: everyone needs it, as in the
@@ -421,8 +463,7 @@ impl<S: ServiceStore> SignalOps<S> {
     ) -> Result<(), OpsError> {
         let OwnIdentity { pn, lid, .. } = self.own_identity().await?;
         let group_str = group.to_string();
-        let lock = self.session_lock();
-        let _guard = lock.lock().await;
+        let _held = self.lock_keys(vec![group_key(&group_str)]).await;
         for device in devices {
             if device.is_same_user_as(&pn)
                 || lid.as_ref().is_some_and(|l| device.is_same_user_as(l))
@@ -444,8 +485,7 @@ impl<S: ServiceStore> SignalOps<S> {
     /// distributes it again. Use after membership changes.
     pub async fn forget_sender_key_devices(&self, group: &Jid) -> Result<(), OpsError> {
         let prefix = format!("{group}\u{0}");
-        let lock = self.session_lock();
-        let _guard = lock.lock().await;
+        let _held = self.lock_keys(vec![group_key(&group.to_string())]).await;
         let keys = self
             .store()
             .scan_aux(Namespace::SenderKeyDevices, &prefix)
@@ -472,8 +512,7 @@ impl<S: ServiceStore> SignalOps<S> {
         let OwnIdentity { account, .. } = self.own_identity().await?;
         let address = request.encryption_jid.to_protocol_address();
 
-        let lock = self.session_lock();
-        let _guard = lock.lock().await;
+        let _held = self.lock_keys(vec![session_key(&address)]).await;
         let staged = std::sync::Arc::new(self.store().staged());
         if let Some(bundle) = request.bundle {
             self.establish_into(&staged, &address, bundle).await?;
@@ -535,5 +574,23 @@ impl<S: ServiceStore> SignalOps<S> {
         staged.commit().await?;
         wacore_binary::marshal(&node)
             .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))
+    }
+
+    /// Delete sent-message records inserted before `cutoff_ms`; a retry
+    /// receipt for an older message can no longer be answered. Returns how
+    /// many were removed.
+    pub async fn prune_sent_messages(&self, cutoff_ms: u64) -> Result<usize, OpsError> {
+        let store = self.store();
+        let mut expired = Vec::new();
+        for key in store.scan_aux(Namespace::SentMessage, "").await? {
+            if let Some(record) = store.load_aux(Namespace::SentMessage, &key).await?
+                && decode_sent(&record)?.0 < cutoff_ms
+            {
+                expired.push(key);
+            }
+        }
+        let refs: Vec<&str> = expired.iter().map(String::as_str).collect();
+        store.delete_aux(Namespace::SentMessage, &refs).await?;
+        Ok(expired.len())
     }
 }

@@ -5,7 +5,9 @@
 //! scope with a random suffix, so the suite can share a database with other
 //! tests and with earlier runs.
 
-use crate::record::{Fence, LeaseStore, Namespace, RecordStore, WriteOp, is_fence_lost};
+use crate::record::{
+    Fence, LeaseStore, Namespace, RecordStore, WriteOp, is_fence_lost, is_record_exists,
+};
 use rand::Rng;
 
 const TTL: u64 = 10_000;
@@ -21,6 +23,7 @@ pub async fn run_all<S: RecordStore + LeaseStore>(store: &S) {
     a_stale_batch_applies_nothing(store, &run).await;
     a_batch_applies_every_op(store, &run).await;
     update_never_inserts(store, &run).await;
+    insert_is_exclusive_and_atomic(store, &run).await;
     scan_orders_filters_and_limits(store, &run).await;
     scopes_and_namespaces_are_isolated(store, &run).await;
     get_many_returns_only_existing_keys(store, &run).await;
@@ -381,5 +384,46 @@ pub async fn get_many_returns_only_existing_keys<S: RecordStore + LeaseStore>(
             ("y".to_owned(), b"2".to_vec())
         ],
         "get_many_returns_only_existing_keys"
+    );
+}
+
+pub async fn insert_is_exclusive_and_atomic<S: RecordStore + LeaseStore>(store: &S, run: &str) {
+    let scope = scope(run, "insert");
+    let fence = take(store, &scope, "a", 1_000).await;
+    let insert = |key: &str, value: &[u8]| WriteOp::Insert {
+        ns: Namespace::Device,
+        key: key.to_owned(),
+        value: value.to_vec(),
+    };
+    store.write(&fence, &[insert("k", b"first")]).await.unwrap();
+    let refused = store
+        .write(
+            &fence,
+            &[
+                put(Namespace::Session, "side-effect", b"x"),
+                insert("k", b"second"),
+            ],
+        )
+        .await;
+    assert!(
+        refused.as_ref().is_err_and(is_record_exists),
+        "insert_is_exclusive_and_atomic: second insert was not refused"
+    );
+    assert_eq!(
+        store
+            .get(&scope, Namespace::Device, "k")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(&b"first"[..]),
+        "insert_is_exclusive_and_atomic: existing record changed"
+    );
+    assert!(
+        store
+            .get(&scope, Namespace::Session, "side-effect")
+            .await
+            .unwrap()
+            .is_none(),
+        "insert_is_exclusive_and_atomic: refused batch applied another op"
     );
 }

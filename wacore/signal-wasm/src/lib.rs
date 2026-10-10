@@ -1,4 +1,4 @@
-//! Browser and edge bindings for [`wacore_signal_ops`].
+//! Browser and edge bindings for `wacore_signal_ops`.
 //!
 //! The page supplies storage and sealing: a `RecordBackend` (IndexedDB in a
 //! browser, anything in an edge worker) and a `Sealer` (WebCrypto, so the data
@@ -28,14 +28,15 @@ const TS_TYPES: &str = r#"
 export interface Fence { scope: string; generation: number }
 export interface Lease { scope: string; generation: number; holder: string; expiresAtMs: number }
 export type WriteOp =
-  | { op: "put" | "update"; ns: string; key: string; value: Uint8Array }
+  | { op: "put" | "update" | "insert"; ns: string; key: string; value: Uint8Array }
   | { op: "delete"; ns: string; key: string };
 
 /**
  * Byte storage for one or more scopes. `write` applies every op or none, and
  * only while `fence.generation` is the scope's current lease generation;
  * otherwise it rejects with an error whose `code` is "fence_lost". An
- * "update" op on a missing key is a no-op, never an insert.
+ * "update" op on a missing key is a no-op, never an insert. An "insert" op on
+ * an existing key rejects the whole batch with `code` "record_exists".
  */
 export interface RecordBackend {
   get(scope: string, ns: string, key: string): Promise<Uint8Array | null | undefined>;
@@ -111,12 +112,21 @@ impl SignalDevice {
             Arc::new(JsSealerAdapter::new(sealer)),
             lease.fence.clone(),
         ));
-        let ops = match SignalOps::open(store.clone()).await {
+        let opened = match SignalOps::open(store.clone()).await {
+            Ok(ops) => Ok(ops),
+            Err(OpsError::NotInitialised) if create => SignalOps::create(store).await,
+            Err(e) => Err(e),
+        };
+        let ops = match opened {
             Ok(ops) => ops,
-            Err(OpsError::NotInitialised) if create => {
-                SignalOps::create(store).await.map_err(ops_error)?
+            Err(e) => {
+                // No SignalDevice is returned, so nobody else could release
+                // this lease; give it up now rather than block other holders
+                // until it expires. A failed release changes nothing for the
+                // caller, who gets the original error.
+                let _ = records.release(&lease).await;
+                return Err(ops_error(e));
             }
-            Err(e) => return Err(ops_error(e)),
         };
         Ok(SignalDevice {
             inner: Rc::new(Inner {
@@ -213,7 +223,7 @@ impl SignalDevice {
         promise(async move {
             let found = inner
                 .ops
-                .has_session(&address(&user, device))
+                .has_session(&address(&user, device)?)
                 .await
                 .map_err(ops_error)?;
             Ok(JsValue::from_bool(found))
@@ -228,7 +238,7 @@ impl SignalDevice {
             let bundle = remote_bundle(&bundle)?;
             inner
                 .ops
-                .establish_session(&address(&user, device), &bundle)
+                .establish_session(&address(&user, device)?, &bundle)
                 .await
                 .map_err(ops_error)?;
             Ok(JsValue::UNDEFINED)
@@ -251,7 +261,7 @@ impl SignalDevice {
             };
             let result = inner
                 .ops
-                .decrypt(&address(&user, device), kind, &ciphertext)
+                .decrypt(&address(&user, device)?, kind, &ciphertext)
                 .await
                 .map_err(ops_error)?;
             let out = Object::new();
@@ -275,7 +285,7 @@ impl SignalDevice {
         promise(async move {
             let result = inner
                 .ops
-                .encrypt(&address(&user, device), &plaintext)
+                .encrypt(&address(&user, device)?, &plaintext)
                 .await
                 .map_err(ops_error)?;
             let out = Object::new();
@@ -295,7 +305,7 @@ impl SignalDevice {
         promise(async move {
             let skdm = inner
                 .ops
-                .sender_key_distribution(&group, &address(&user, device))
+                .sender_key_distribution(&group, &address(&user, device)?)
                 .await
                 .map_err(ops_error)?;
             Ok(Uint8Array::from(skdm.as_slice()).into())
@@ -314,7 +324,7 @@ impl SignalDevice {
         promise(async move {
             let ciphertext = inner
                 .ops
-                .group_encrypt(&group, &address(&user, device), &plaintext)
+                .group_encrypt(&group, &address(&user, device)?, &plaintext)
                 .await
                 .map_err(ops_error)?;
             Ok(Uint8Array::from(ciphertext.as_slice()).into())
@@ -333,7 +343,7 @@ impl SignalDevice {
         promise(async move {
             inner
                 .ops
-                .process_sender_key_distribution(&group, &address(&user, device), &skdm)
+                .process_sender_key_distribution(&group, &address(&user, device)?, &skdm)
                 .await
                 .map_err(ops_error)?;
             Ok(JsValue::UNDEFINED)
@@ -352,7 +362,7 @@ impl SignalDevice {
         promise(async move {
             let plaintext = inner
                 .ops
-                .group_decrypt(&group, &address(&user, device), &ciphertext)
+                .group_decrypt(&group, &address(&user, device)?, &ciphertext)
                 .await
                 .map_err(ops_error)?;
             Ok(Uint8Array::from(plaintext.as_slice()).into())
@@ -388,7 +398,7 @@ impl SignalDevice {
                     ));
                 }
             };
-            let sender = address(&user, device);
+            let sender = address(&user, device)?;
             let received = inner
                 .ops
                 .receive(ReceiveRequest {

@@ -259,6 +259,14 @@ fn only_own_devices_can_hand_over_app_state_keys() {
         .unwrap(),
     );
     assert!(peer.app_state_key_share.is_none());
+    assert!(
+        peer.content
+            .message
+            .protocol_message
+            .as_option()
+            .is_none_or(|p| p.app_state_sync_key_share.as_option().is_none()),
+        "a peer's key share must not reach the app inside the message"
+    );
 
     let from_self = block_on(alice.ops.encrypt(&bob_addr, &padded(&share))).unwrap();
     let own = message(
@@ -293,4 +301,31 @@ fn pruning_drops_old_buffer_entries() {
 
     assert_eq!(block_on(bob.ops.prune_decrypt_buffer(0)).unwrap(), 0);
     assert_eq!(block_on(bob.ops.prune_decrypt_buffer(u64::MAX)).unwrap(), 1);
+}
+
+#[test]
+fn a_bad_sender_key_does_not_block_the_message_carrying_it() {
+    let alice = device("alice-bad-skdm");
+    let bob = device("bob-bad-skdm");
+    let (alice_addr, bob_addr) = (address("111"), address("222"));
+    connect(&alice, &bob, &bob_addr);
+    let carrier = wa::Message {
+        conversation: Some("still readable".to_owned()),
+        sender_key_distribution_message: Some(wa::message::SenderKeyDistributionMessage {
+            group_id: Some(GROUP.to_owned()),
+            axolotl_sender_key_distribution_message: Some(vec![0xde, 0xad]),
+        })
+        .into(),
+        ..Default::default()
+    };
+    let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&carrier))).unwrap();
+    let req = request(GROUP, &alice_addr, kind(&sent), &sent.ciphertext, false);
+    let first = message(block_on(bob.ops.receive(req)).unwrap());
+    assert!(first.sender_key_rejected);
+    assert_eq!(
+        first.content.message.conversation.as_deref(),
+        Some("still readable")
+    );
+    // Committed: a redelivery is served from the buffer, not decrypted again.
+    assert!(message(block_on(bob.ops.receive(req)).unwrap()).redelivered);
 }

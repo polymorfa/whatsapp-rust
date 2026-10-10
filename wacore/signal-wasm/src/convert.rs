@@ -2,7 +2,7 @@
 
 use js_sys::{Array, Error, Object, Reflect, Uint8Array};
 use std::sync::Arc;
-use wacore::libsignal::protocol::{DeviceId, ProtocolAddress};
+use wacore::libsignal::protocol::ProtocolAddress;
 use wacore_recordstore::{Fence, Lease};
 use wacore_signal_ops::{OpsError, PublicIdentity, PublicPreKey, PublicSignedPreKey, RemoteBundle};
 use wasm_bindgen::{JsCast, JsValue};
@@ -56,8 +56,16 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     message
 }
 
-pub fn address(user: &str, device: u32) -> ProtocolAddress {
-    ProtocolAddress::new(user, DeviceId::from(device))
+/// The Signal address of `device` of `user`, encoded the way every wacore
+/// store keys it (`JidExt::to_protocol_address`), so sessions created here
+/// are the same records the send and receive paths use.
+pub fn address(user: &str, device: u32) -> Result<ProtocolAddress, JsValue> {
+    use wacore::types::jid::JidExt as _;
+    let device = u16::try_from(device).map_err(|_| invalid("device must fit in 16 bits"))?;
+    let jid: wacore_binary::Jid = user
+        .parse()
+        .map_err(|_| invalid(&format!("{user} is not a JID")))?;
+    Ok(jid.with_device(device).to_protocol_address())
 }
 
 fn bytes(value: &[u8]) -> JsValue {

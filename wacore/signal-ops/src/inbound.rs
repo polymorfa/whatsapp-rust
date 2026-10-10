@@ -7,7 +7,7 @@
 //! buffered result; once delivered it returns [`Received::AlreadyDelivered`].
 
 use crate::error::OpsError;
-use crate::ops::{EncKind, ServiceStore, SignalOps};
+use crate::ops::{EncKind, ServiceStore, SignalOps, chain_key, session_key};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use wacore::libsignal::protocol::ProtocolAddress;
@@ -74,6 +74,10 @@ pub struct ReceivedMessage {
     pub identity_changed: bool,
     /// Served from the buffer after an earlier decrypt was not acknowledged.
     pub redelivered: bool,
+    /// The message carried a sender-key distribution that could not be
+    /// stored. The rest of the message is still delivered; later group
+    /// messages from this sender fail until a valid distribution arrives.
+    pub sender_key_rejected: bool,
     /// An app-state key share, only when sent by one of this account's own
     /// devices (WA Web's `isMeAccount` gate). The one piece of content the
     /// Polymorfa client receives.
@@ -150,8 +154,25 @@ fn classify(
     padding_version: u8,
     is_from_me: bool,
 ) -> Result<DecryptedMessageResult, OpsError> {
-    process_decrypted_plaintext(padded, padding_version, is_from_me)
-        .map_err(|e| OpsError::InvalidInput(format!("plaintext did not decode: {e}")))
+    let mut content = process_decrypted_plaintext(padded, padding_version, is_from_me)
+        .map_err(|e| OpsError::InvalidInput(format!("plaintext did not decode: {e}")))?;
+    if !is_from_me {
+        strip_app_state_keys(&mut content);
+    }
+    Ok(content)
+}
+
+/// App-state key shares and requests are only honoured from this account's
+/// own devices (WA Web's `isMeAccount` gate). From anyone else they are
+/// removed everywhere, so they cannot reach the app through the message.
+fn strip_app_state_keys(content: &mut DecryptedMessageResult) {
+    if let Some(protocol) = content.message.protocol_message.as_option_mut() {
+        protocol.app_state_sync_key_share = Default::default();
+        protocol.app_state_sync_key_request = Default::default();
+    }
+    if let Some(info) = content.protocol_message.as_mut() {
+        info.app_state_sync_key_share = None;
+    }
 }
 
 fn key_share(
@@ -172,8 +193,14 @@ impl<S: ServiceStore> SignalOps<S> {
     /// distributions inside it are stored in the same batch as the decrypt.
     pub async fn receive(&self, request: ReceiveRequest<'_>) -> Result<Received, OpsError> {
         let receipt_key = receipt_key(&request);
-        let lock = self.session_lock();
-        let _guard = lock.lock().await;
+        // Pairwise payloads can carry a sender-key distribution for this chat,
+        // so they also lock the sender's chain.
+        let chain = chain_key(request.chat, request.sender.as_str());
+        let keys = match request.kind {
+            ReceiveKind::SenderKey => vec![chain],
+            _ => vec![session_key(request.sender), chain],
+        };
+        let _held = self.lock_keys(keys).await;
 
         if let Some(bytes) = self
             .store()
@@ -195,6 +222,7 @@ impl<S: ServiceStore> SignalOps<S> {
                 content,
                 identity_changed: entry.identity_changed,
                 redelivered: true,
+                sender_key_rejected: false,
             })));
         }
 
@@ -236,16 +264,23 @@ impl<S: ServiceStore> SignalOps<S> {
             }
         };
 
+        // A bad distribution must not block the message carrying it: failing
+        // here would discard the ratchet advance, and every redelivery would
+        // fail the same way. The client logs and continues the same way.
+        let mut sender_key_rejected = false;
         if let Some(skdm) = &content.skdm
             && let Some(axolotl) = &skdm.axolotl_sender_key_distribution_message
+            && self
+                .process_sender_key_distribution_into(
+                    &staged,
+                    request.chat,
+                    request.sender,
+                    axolotl,
+                )
+                .await
+                .is_err()
         {
-            self.process_sender_key_distribution_into(
-                &staged,
-                request.chat,
-                request.sender,
-                axolotl,
-            )
-            .await?;
+            sender_key_rejected = true;
         }
 
         let entry = BufferEntry {
@@ -266,6 +301,7 @@ impl<S: ServiceStore> SignalOps<S> {
             content,
             identity_changed,
             redelivered: false,
+            sender_key_rejected,
         })))
     }
 
