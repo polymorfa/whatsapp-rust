@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+buffa = { workspace = true }
 js-sys = "0.3.105"
 send_wrapper = "0.6"
 wacore = { workspace = true }
@@ -29,3 +30,13 @@ waproto = { workspace = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, features = ["wasm_js"] }
+
+[dev-dependencies]
+buffa = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+serde_json = { workspace = true }
+wacore = { workspace = true, features = ["test-util"] }
+wacore-binary = { workspace = true }
+waproto = { workspace = true }

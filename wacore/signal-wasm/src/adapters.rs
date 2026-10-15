@@ -67,6 +67,11 @@ extern "C" {
     #[wasm_bindgen(typescript_type = "Sealer")]
     pub type Sealer;
 
+    // An opaque JS value keeps bool consent strict while retaining an
+    // optional boolean in generated TypeScript (no truthiness coercion).
+    #[wasm_bindgen(typescript_type = "boolean")]
+    pub type AppStateSharingConsent;
+
     #[wasm_bindgen(method, catch)]
     fn seal(
         this: &Sealer,

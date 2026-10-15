@@ -73,6 +73,35 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
         &self.fence
     }
 
+    /// Count surviving prekeys marked uploaded, refusing a superseded fence.
+    /// Missing records consumed during this read are skipped. This is a
+    /// count of local state, not confirmation of the provider's current pool.
+    pub async fn uploaded_prekey_count(&self) -> Result<u32> {
+        self.records.write(&self.fence, &[]).await?;
+        let keys = self.scan(Namespace::PreKey, "", None).await?;
+        let mut count = 0u32;
+        for chunk in keys.chunks(128) {
+            let refs: Vec<_> = chunk.iter().map(String::as_str).collect();
+            for (_, value) in self.load_many(Namespace::PreKey, &refs).await? {
+                match value.first() {
+                    Some(&PREKEY_UPLOADED) => {
+                        count = count
+                            .checked_add(1)
+                            .ok_or_else(|| StoreError::Validation("prekey count overflow".into()))?
+                    }
+                    Some(&PREKEY_NOT_UPLOADED) => {}
+                    _ => {
+                        return Err(StoreError::Validation(
+                            "prekey record has no upload flag".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        self.records.write(&self.fence, &[]).await?;
+        Ok(count)
+    }
+
     /// A view over the same scope whose writes are held until [`Self::commit`].
     /// Reads see the view's own pending writes first.
     pub fn staged(&self) -> Self {
@@ -903,10 +932,12 @@ mod tests {
             (100, Bytes::from_static(b"hundred")),
         ];
         block_on(store.store_prekeys_batch(&keys, false)).unwrap();
+        assert_eq!(block_on(store.uploaded_prekey_count()).unwrap(), 0);
         assert_eq!(block_on(store.get_max_prekey_id()).unwrap(), 100);
 
         block_on(store.remove_prekey(10)).unwrap();
         block_on(store.mark_prekeys_uploaded(&[9, 10])).unwrap();
+        assert_eq!(block_on(store.uploaded_prekey_count()).unwrap(), 1);
         assert_eq!(block_on(store.load_prekey(10)).unwrap(), None);
         assert_eq!(
             block_on(store.load_prekey(9)).unwrap().as_deref(),

@@ -3,6 +3,14 @@
 //! The page supplies storage and sealing: a `RecordBackend` (IndexedDB in a
 //! browser, anything in an edge worker) and a `Sealer` (WebCrypto, so the data
 //! key can stay non-extractable). This crate supplies the Signal state machine.
+//! Supply an initialized wasm-bindgen module exposing `SignalDevice`, not a
+//! bare WebAssembly instance. Keep one device per held scope. Neither this
+//! module nor its local Node tests establish a browser transport or grant flow.
+//! App-state sharing is a separate default-off choice: enabling it permits
+//! contact-name, label and mute/archive/pin metadata decryption. Message
+//! plaintext custody does not imply metadata opacity. Protect the caller's
+//! store/sealer, renew its lease, and persist application content before
+//! `markDelivered`. The host still owns history consent and transport policy.
 #![cfg(target_arch = "wasm32")]
 
 mod adapters;
@@ -63,6 +71,21 @@ export interface RemoteBundle {
   prekeyId?: number;
   prekey?: Uint8Array;
 }
+export interface PublicPreKey { id: number; publicKey: Uint8Array }
+export interface PrekeyUploadBatch { batchId: string; preKeys: PublicPreKey[] }
+export type RetryRoute =
+  | { kind: "direct"; recipient?: string }
+  | { kind: "group"; addressingMode: "pn" | "lid" }
+  | { kind: "broadcast_list" };
+export interface RetryRequest {
+  chat: string; messageId: string; requester: string; encryptionJid: string;
+  retryCount: number; route: RetryRoute; bundle?: RemoteBundle;
+}
+export type ReceiveResult =
+  | { status: "already_delivered"; receiptKey: string }
+  | { status: "message"; receiptKey: string; message: Uint8Array;
+      isSkdmOnly: boolean; identityChanged: boolean; redelivered: boolean;
+      senderKeyRejected: boolean; appStateKeyShare: Uint8Array };
 "#;
 
 type Store = RecordSignalStore<JsRecords, JsSealerAdapter>;
@@ -71,6 +94,7 @@ struct Inner {
     ops: SignalOps<Store>,
     records: Arc<JsRecords>,
     lease: RefCell<Lease>,
+    store: Arc<Store>,
 }
 
 /// One linked device's Signal state, held under a lease.
@@ -114,7 +138,7 @@ impl SignalDevice {
         ));
         let opened = match SignalOps::open(store.clone()).await {
             Ok(ops) => Ok(ops),
-            Err(OpsError::NotInitialised) if create => SignalOps::create(store).await,
+            Err(OpsError::NotInitialised) if create => SignalOps::create(store.clone()).await,
             Err(e) => Err(e),
         };
         let ops = match opened {
@@ -133,6 +157,7 @@ impl SignalDevice {
                 ops,
                 records,
                 lease: RefCell::new(lease),
+                store,
             }),
         })
     }
@@ -191,6 +216,60 @@ impl SignalDevice {
         promise(async move {
             let keys = inner.ops.generate_prekeys(count).await.map_err(ops_error)?;
             Ok(public_prekeys(&keys))
+        })
+    }
+
+    /// Durable public upload batch. Repeated calls/reopening recover the
+    /// outstanding live batch; use fresh `generatePrekeys` for retry receipts.
+    #[wasm_bindgen(js_name = preparePrekeyUpload, unchecked_return_type = "Promise<PrekeyUploadBatch>")]
+    pub fn prepare_prekey_upload(&self, count: f64) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            if count.fract() != 0.0 || !(1.0..=812.0).contains(&count) {
+                return Err(convert::coded_error(
+                    "invalid_input",
+                    "prekey count must be an integer from 1 to 812",
+                ));
+            }
+            let batch = inner
+                .ops
+                .prepare_prekey_upload(count as u32)
+                .await
+                .map_err(ops_error)?;
+            let out = Object::new();
+            set(&out, "batchId", &JsValue::from_str(&batch.batch_id));
+            set(&out, "preKeys", &public_prekeys(&batch.pre_keys));
+            Ok(out.into())
+        })
+    }
+
+    /// Confirm a successful upload by its exact batch and member IDs. The
+    /// latest exact ACK replays safely after a lost response/reopening.
+    #[wasm_bindgen(js_name = acknowledgePrekeyUpload, unchecked_return_type = "Promise<void>")]
+    pub fn acknowledge_prekey_upload(&self, batch_id: String, ids: Uint32Array) -> Promise {
+        let inner = self.inner.clone();
+        let ids = ids.to_vec();
+        promise(async move {
+            inner
+                .ops
+                .acknowledge_prekey_upload(&batch_id, &ids)
+                .await
+                .map_err(ops_error)?;
+            Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    /// Local surviving uploaded keys; this does not query the provider pool.
+    #[wasm_bindgen(js_name = uploadedPrekeyCount, unchecked_return_type = "Promise<number>")]
+    pub fn uploaded_prekey_count(&self) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let count = inner
+                .store
+                .uploaded_prekey_count()
+                .await
+                .map_err(|e| ops_error(OpsError::Store(e)))?;
+            Ok(JsValue::from_f64(f64::from(count)))
         })
     }
 
@@ -371,9 +450,13 @@ impl SignalDevice {
 
     /// Decrypt, buffer and classify one received payload. Resolves
     /// `{ status: "message", receiptKey, message, isSkdmOnly, identityChanged,
-    /// redelivered }` where `message` is the encoded, unpadded `waE2E.Message`,
+    /// redelivered, senderKeyRejected, appStateKeyShare }` where `message` is
+    /// the encoded, unpadded `waE2E.Message` without app-state key fields,
     /// or `{ status: "already_delivered", receiptKey }`. Call `markDelivered`
-    /// once the app has stored the message.
+    /// once the app has stored the message. `share_app_state_keys` defaults
+    /// off; enabling it exposes own-device app-state keys separately, allowing
+    /// synchronized metadata decryption. It never enables foreign-device shares.
+    #[wasm_bindgen(unchecked_return_type = "Promise<ReceiveResult>")]
     #[allow(clippy::too_many_arguments)]
     pub fn receive(
         &self,
@@ -384,9 +467,19 @@ impl SignalDevice {
         ciphertext: Vec<u8>,
         padding_version: u8,
         is_from_me: bool,
+        share_app_state_keys: Option<adapters::AppStateSharingConsent>,
     ) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
+            let share_app_state_keys = match share_app_state_keys {
+                None => false,
+                Some(value) => value.as_bool().ok_or_else(|| {
+                    convert::coded_error(
+                        "invalid_input",
+                        "app-state sharing consent must be boolean",
+                    )
+                })?,
+            };
             let kind = match kind.as_str() {
                 "pkmsg" => ReceiveKind::PreKey,
                 "msg" => ReceiveKind::Message,
@@ -417,9 +510,19 @@ impl SignalDevice {
                     set(&out, "status", &JsValue::from_str("already_delivered"));
                     set(&out, "receiptKey", &JsValue::from_str(&receipt_key));
                 }
-                Received::Message(message) => {
+                Received::Message(mut message) => {
                     set(&out, "status", &JsValue::from_str("message"));
                     set(&out, "receiptKey", &JsValue::from_str(&message.receipt_key));
+                    if let Some(protocol) = message.content.message.protocol_message.as_option_mut()
+                    {
+                        protocol.app_state_sync_key_share = Default::default();
+                        protocol.app_state_sync_key_request = Default::default();
+                    }
+                    message.content.message.sender_key_distribution_message = Default::default();
+                    message
+                        .content
+                        .message
+                        .fast_ratchet_key_sender_key_distribution_message = Default::default();
                     let encoded = waproto::codec::message_to_vec(&message.content.message);
                     set(&out, "message", &Uint8Array::from(encoded.as_slice()));
                     set(
@@ -436,6 +539,25 @@ impl SignalDevice {
                         &out,
                         "redelivered",
                         &JsValue::from_bool(message.redelivered),
+                    );
+                    set(
+                        &out,
+                        "senderKeyRejected",
+                        &JsValue::from_bool(message.sender_key_rejected),
+                    );
+                    let share = if share_app_state_keys && is_from_me {
+                        message
+                            .app_state_key_share
+                            .as_ref()
+                            .map(convert::app_state_share)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    set(
+                        &out,
+                        "appStateKeyShare",
+                        &Uint8Array::from(share.as_slice()),
                     );
                 }
             }
@@ -596,6 +718,59 @@ impl SignalDevice {
                 .await
                 .map_err(ops_error)?;
             Ok(JsValue::UNDEFINED)
+        })
+    }
+
+    /// Rebuild a stored sent message for a retry receipt. Only ciphertext
+    /// stanza bytes leave this method. The caller sends them unchanged and
+    /// applies its transport admission/pacing before sending.
+    #[wasm_bindgen(unchecked_return_type = "Promise<Uint8Array>")]
+    pub fn resend(
+        &self,
+        resolver: send::SendResolver,
+        #[wasm_bindgen(unchecked_param_type = "RetryRequest")] request: JsValue,
+    ) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let request = convert::retry_request(&request)?;
+            let resolver = send::JsResolver::new(resolver);
+            let stanza = inner
+                .ops
+                .resend(
+                    &resolver,
+                    wacore_signal_ops::RetryRequest {
+                        chat: &request.chat,
+                        message_id: &request.message_id,
+                        requester: &request.requester,
+                        encryption_jid: &request.encryption_jid,
+                        route: request.route,
+                        retry_count: request.retry_count,
+                        bundle: request.bundle.as_ref(),
+                    },
+                )
+                .await
+                .map_err(ops_error)?;
+            Ok(Uint8Array::from(stanza.as_slice()).into())
+        })
+    }
+
+    /// Retire encrypted local retry records before this Unix-ms cutoff.
+    #[wasm_bindgen(js_name = pruneSentMessages, unchecked_return_type = "Promise<number>")]
+    pub fn prune_sent_messages(&self, cutoff_ms: f64) -> Promise {
+        let inner = self.inner.clone();
+        promise(async move {
+            let cutoff = convert::safe_u64(cutoff_ms, "cutoffMs").map_err(|_| {
+                convert::coded_error(
+                    "invalid_input",
+                    "cutoffMs must be a non-negative safe integer",
+                )
+            })?;
+            let count = inner
+                .ops
+                .prune_sent_messages(cutoff)
+                .await
+                .map_err(ops_error)?;
+            Ok(JsValue::from_f64(count as f64))
         })
     }
 

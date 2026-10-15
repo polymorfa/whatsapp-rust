@@ -152,7 +152,7 @@ pub fn remote_bundle(value: &JsValue) -> Result<RemoteBundle, JsValue> {
 
 /// Generations and expiry times travel as JS numbers; both stay far below
 /// 2^53 in practice, and the conversion rejects anything that is not.
-fn safe_u64(value: f64, what: &str) -> Result<u64, String> {
+pub fn safe_u64(value: f64, what: &str) -> Result<u64, String> {
     if value.fract() != 0.0 || !(0.0..=9_007_199_254_740_991.0).contains(&value) {
         return Err(format!("{what} must be a non-negative safe integer"));
     }
@@ -232,4 +232,70 @@ pub fn jid_list(jids: &[wacore_binary::Jid]) -> JsValue {
 pub fn message(bytes: &[u8]) -> Result<waproto::whatsapp::Message, JsValue> {
     waproto::codec::message_decode(bytes)
         .map_err(|e| invalid(&format!("message is not an encoded waE2E.Message: {e}")))
+}
+
+/// This non-hot protocol root has no pinned waproto codec entry point.
+#[allow(clippy::disallowed_methods)]
+pub fn app_state_share(value: &waproto::whatsapp::message::AppStateSyncKeyShare) -> Vec<u8> {
+    use buffa::Message as _;
+    value.encode_to_vec()
+}
+
+pub struct ParsedRetry {
+    pub chat: wacore_binary::Jid,
+    pub message_id: String,
+    pub requester: wacore_binary::Jid,
+    pub encryption_jid: wacore_binary::Jid,
+    pub retry_count: u8,
+    pub route: wacore_signal_ops::RetryRoute,
+    pub bundle: Option<RemoteBundle>,
+}
+
+fn string_field(value: &JsValue, name: &str) -> Result<String, JsValue> {
+    get(value, name)
+        .as_string()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| invalid(&format!("{name} must be a nonempty string")))
+}
+
+pub fn retry_request(value: &JsValue) -> Result<ParsedRetry, JsValue> {
+    use wacore::types::message::AddressingMode;
+    use wacore_signal_ops::RetryRoute;
+    let route = get(value, "route");
+    let route = match string_field(&route, "kind")?.as_str() {
+        "direct" => {
+            let recipient = get(&route, "recipient");
+            RetryRoute::Direct {
+                recipient: if recipient.is_null() || recipient.is_undefined() {
+                    None
+                } else {
+                    Some(jid(&string_field(&route, "recipient")?)?)
+                },
+            }
+        }
+        "group" => RetryRoute::Group {
+            addressing_mode: match string_field(&route, "addressingMode")?.as_str() {
+                "pn" => AddressingMode::Pn,
+                "lid" => AddressingMode::Lid,
+                _ => return Err(invalid("addressingMode must be pn or lid")),
+            },
+        },
+        "broadcast_list" => RetryRoute::BroadcastList,
+        _ => return Err(invalid("retry route kind is invalid")),
+    };
+    let bundle = get(value, "bundle");
+    Ok(ParsedRetry {
+        chat: jid(&string_field(value, "chat")?)?,
+        message_id: string_field(value, "messageId")?,
+        requester: jid(&string_field(value, "requester")?)?,
+        encryption_jid: jid(&string_field(value, "encryptionJid")?)?,
+        retry_count: u8::try_from(u32_field(value, "retryCount")?)
+            .map_err(|_| invalid("retryCount must fit in 8 bits"))?,
+        route,
+        bundle: if bundle.is_null() || bundle.is_undefined() {
+            None
+        } else {
+            Some(remote_bundle(&bundle)?)
+        },
+    })
 }
