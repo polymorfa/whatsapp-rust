@@ -383,11 +383,11 @@ impl<S: ServiceStore> SignalOps<S> {
                 .devices()
                 .iter()
                 .filter(|device| {
-                    !device.is_hosted()
-                        && !(device.user == own_sending.user && device.device == own_sending.device)
+                    !(device.is_hosted()
+                        || device.user == own_sending.user && device.device == own_sending.device
                         // WA Web treats a companion as warm only if its
                         // primary (device 0) is too.
-                        && !(is_warm(device) && is_warm(&device.with_device(0)))
+                        || is_warm(device) && is_warm(&device.with_device(0)))
                 })
                 .cloned()
                 .collect()
