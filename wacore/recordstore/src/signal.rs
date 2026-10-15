@@ -318,6 +318,33 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
         self.put_one(ns, key, plaintext).await
     }
 
+    /// Insert an auxiliary record exclusively, including in a staged batch.
+    pub async fn insert_aux(&self, ns: Namespace, key: &str, plaintext: &[u8]) -> Result<()> {
+        Self::check_aux(ns)?;
+        self.apply(vec![PlainOp::Insert(
+            ns,
+            key.to_owned(),
+            plaintext.to_vec(),
+        )])
+        .await
+    }
+
+    /// Reserve fresh prekey IDs without overwriting an existing private key.
+    pub async fn insert_prekeys_batch(&self, keys: &[(u32, Bytes)]) -> Result<()> {
+        self.apply(
+            keys.iter()
+                .map(|(id, record)| {
+                    PlainOp::Insert(
+                        Namespace::PreKey,
+                        id_key(*id),
+                        prekey_plaintext(record, false),
+                    )
+                })
+                .collect(),
+        )
+        .await
+    }
+
     /// Delete records in one of the service's own namespaces.
     pub async fn delete_aux(&self, ns: Namespace, keys: &[&str]) -> Result<()> {
         Self::check_aux(ns)?;

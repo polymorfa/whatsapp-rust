@@ -23,6 +23,10 @@ use wacore::types::jid::JidExt;
 use wacore_binary::{Jid, Server};
 use wacore_recordstore::{Namespace, RecordSignalStore, RecordStore, Sealer};
 
+#[path = "prekeys.rs"]
+mod prekeys;
+pub use prekeys::PreKeyUploadBatch;
+
 /// Storage the Signal service needs beyond [`SignalStore`]: the device key
 /// blob, its own records (decrypt buffer, sent messages), and staged views
 /// whose writes commit as one batch.
@@ -40,6 +44,9 @@ pub trait ServiceStore: SignalStore + Sized + 'static {
     async fn commit(&self) -> StoreResult<()>;
     async fn load_aux(&self, ns: Namespace, key: &str) -> StoreResult<Option<Vec<u8>>>;
     async fn put_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()>;
+    /// Exclusive inserts used to publish durable prekey uploads atomically.
+    async fn insert_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()>;
+    async fn insert_prekeys_batch(&self, keys: &[(u32, bytes::Bytes)]) -> StoreResult<()>;
     async fn delete_aux(&self, ns: Namespace, keys: &[&str]) -> StoreResult<()>;
     async fn scan_aux(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>>;
     /// Addresses with a stored session ([`Namespace::Session`]) or identity
@@ -76,6 +83,14 @@ impl<R: RecordStore + 'static, S: Sealer + 'static> ServiceStore for RecordSigna
 
     async fn put_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()> {
         RecordSignalStore::put_aux(self, ns, key, value).await
+    }
+
+    async fn insert_aux(&self, ns: Namespace, key: &str, value: &[u8]) -> StoreResult<()> {
+        RecordSignalStore::insert_aux(self, ns, key, value).await
+    }
+
+    async fn insert_prekeys_batch(&self, keys: &[(u32, bytes::Bytes)]) -> StoreResult<()> {
+        RecordSignalStore::insert_prekeys_batch(self, keys).await
     }
 
     async fn delete_aux(&self, ns: Namespace, keys: &[&str]) -> StoreResult<()> {
@@ -330,45 +345,11 @@ impl<S: ServiceStore> SignalOps<S> {
         self.keys.read().await.public()
     }
 
-    /// Create `count` one-time prekeys and return their public halves for
-    /// upload. The ID counter advances before the keys are written, so a crash
-    /// leaves a gap rather than reusing an ID.
+    /// Generate fresh one-time prekeys for retry receipts. Unlike
+    /// `prepare_prekey_upload`, each call reserves new IDs. The counter and
+    /// private keys commit together; active upload IDs remain reserved.
     pub async fn generate_prekeys(&self, count: u32) -> Result<Vec<PublicPreKey>, OpsError> {
-        if count == 0 || count > 812 {
-            // 812 is WhatsApp Web's upload ceiling per request.
-            return Err(OpsError::InvalidInput(
-                "prekey count must be 1 to 812".into(),
-            ));
-        }
-        let _guard = self.device_write.lock().await;
-        let mut keys = (**self.keys.read().await).clone();
-        let first = keys.next_prekey_id;
-        let mut ids = Vec::with_capacity(count as usize);
-        let mut next = first;
-        for _ in 0..count {
-            ids.push(next);
-            next = if next >= MAX_PREKEY_ID { 1 } else { next + 1 };
-        }
-        keys.next_prekey_id = next;
-        self.replace_keys(keys).await?;
-
-        let mut rng = rng();
-        let mut records = Vec::with_capacity(ids.len());
-        let mut public = Vec::with_capacity(ids.len());
-        for id in ids {
-            let pair = KeyPair::generate(&mut rng);
-            let structure = record_helpers::new_pre_key_record(id, &pair);
-            records.push((
-                id,
-                bytes::Bytes::from(waproto::codec::pre_key_record_to_vec(&structure)),
-            ));
-            public.push(PublicPreKey {
-                id,
-                public_key: public_bytes(&pair.public_key),
-            });
-        }
-        self.store.store_prekeys_batch(&records, false).await?;
-        Ok(public)
+        self.generate_fresh_prekeys(count).await
     }
 
     /// Record that the client uploaded these prekeys. Consumed keys stay gone.

@@ -10,6 +10,14 @@
 //! Message padding is the caller's concern: [`SignalOps::decrypt`] returns
 //! libsignal's plaintext exactly as received and [`SignalOps::encrypt`] takes
 //! already padded plaintext.
+//!
+//! Use [`SignalOps::prepare_prekey_upload`] for ordinary public-key uploads:
+//! its sealed pending batch survives reopening, and retries do not allocate
+//! more private keys. Acknowledge a successful server upload with
+//! [`SignalOps::acknowledge_prekey_upload`]; the last exact acknowledgment is
+//! replayable after a lost response. [`SignalOps::generate_prekeys`] remains
+//! fresh generation for retry receipts. All three use the scope's fenced store;
+//! upload batch IDs remain reserved across 24-bit wrap even after consumption.
 
 mod device;
 mod error;
@@ -22,6 +30,7 @@ pub use device::{DeviceKeys, PublicIdentity, PublicPreKey, PublicSignedPreKey};
 pub use error::OpsError;
 pub use inbound::{ReceiveKind, ReceiveRequest, Received, ReceivedMessage};
 pub use ops::{
-    Decrypted, EncKind, Encrypted, PairingSignature, RemoteBundle, ServiceStore, SignalOps,
+    Decrypted, EncKind, Encrypted, PairingSignature, PreKeyUploadBatch, RemoteBundle, ServiceStore,
+    SignalOps,
 };
 pub use outbound::{PreparedGroupSend, PreparedSend, RetryRequest, RetryRoute};
