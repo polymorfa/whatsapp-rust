@@ -273,6 +273,8 @@ impl SignalDevice {
         })
     }
 
+    /// Mark fresh retry keys only. Any original pending upload member rejects
+    /// the entire call; use `acknowledgePrekeyUpload` for durable batches.
     #[wasm_bindgen(js_name = markPrekeysUploaded)]
     pub fn mark_prekeys_uploaded(&self, ids: Uint32Array) -> Promise {
         let inner = self.inner.clone();

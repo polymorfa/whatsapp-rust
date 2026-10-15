@@ -626,6 +626,11 @@ test("durable public uploads recover failed commits and lost prepare or ACK resp
   assert.equal(await bob.signal.uploadedPrekeyCount(), 0);
   const ids = Uint32Array.from(batch.preKeys.map((key) => key.id));
   await assert.rejects(
+    bob.signal.markPrekeysUploaded(Uint32Array.of(fresh[0].id, ids[0])),
+    (e) => e.code === "invalid_input",
+  );
+  assert.equal(await bob.signal.uploadedPrekeyCount(), 0);
+  await assert.rejects(
     bob.signal.acknowledgePrekeyUpload(batch.batchId, ids.subarray(0, 1)),
     (e) => e.code === "invalid_input",
   );
@@ -660,6 +665,8 @@ test("durable public uploads recover failed commits and lost prepare or ACK resp
     3,
     "fresh retry key was not marked uploaded",
   );
+  await reopened.markPrekeysUploaded(Uint32Array.of(fresh[0].id));
+  assert.equal(await reopened.uploadedPrekeyCount(), 4);
   await reopened.release();
   reopened.free();
 });
@@ -718,6 +725,10 @@ test("uploaded counts and recovered batches exclude keys consumed by actual encr
   const live = await bob.signal.preparePrekeyUpload(1);
   assert.equal(live.batchId, batch.batchId);
   assert.deepEqual(live.preKeys, batch.preKeys.slice(1));
+  await assert.rejects(
+    bob.signal.markPrekeysUploaded(Uint32Array.of(batch.preKeys[0].id)),
+    (e) => e.code === "invalid_input",
+  );
   await bob.signal.acknowledgePrekeyUpload(
     batch.batchId,
     Uint32Array.from(batch.preKeys.map((key) => key.id)),

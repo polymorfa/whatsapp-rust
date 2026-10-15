@@ -16,7 +16,9 @@
 //! more private keys. Acknowledge a successful server upload with
 //! [`SignalOps::acknowledge_prekey_upload`]; the last exact acknowledgment is
 //! replayable after a lost response. [`SignalOps::generate_prekeys`] remains
-//! fresh generation for retry receipts. All three use the scope's fenced store;
+//! fresh generation for retry receipts; [`SignalOps::mark_prekeys_uploaded`]
+//! marks only those fresh keys and rejects pending upload members atomically.
+//! These operations use the scope's fenced store;
 //! upload batch IDs remain reserved across 24-bit wrap even after consumption.
 
 mod device;

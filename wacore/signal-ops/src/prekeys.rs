@@ -242,6 +242,21 @@ impl<S: ServiceStore> SignalOps<S> {
         self.allocate_prekeys(count, &reserved, None).await
     }
 
+    pub(super) async fn mark_fresh_prekeys_uploaded(&self, ids: &[u32]) -> Result<(), OpsError> {
+        let _held = self.device_write.lock().await;
+        if let Some(batch) = self.pending_upload().await? {
+            let reserved: BTreeSet<_> = batch.pre_keys.iter().map(|key| key.id).collect();
+            // Original membership, including consumed keys, remains batch
+            // authority until ACK or retirement. Check before any flag write.
+            if ids.iter().any(|id| reserved.contains(id)) {
+                return Err(OpsError::InvalidInput(
+                    "pending upload members require batch acknowledgment".into(),
+                ));
+            }
+        }
+        Ok(self.store.mark_prekeys_uploaded(ids).await?)
+    }
+
     async fn allocate_prekeys(
         &self,
         count: u32,

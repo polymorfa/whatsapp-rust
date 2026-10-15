@@ -352,9 +352,11 @@ impl<S: ServiceStore> SignalOps<S> {
         self.generate_fresh_prekeys(count).await
     }
 
-    /// Record that the client uploaded these prekeys. Consumed keys stay gone.
+    /// Mark fresh retry prekeys uploaded. Any original member of the pending
+    /// upload batch rejects the entire call; use `acknowledge_prekey_upload`
+    /// for that batch. Consumed keys stay gone.
     pub async fn mark_prekeys_uploaded(&self, ids: &[u32]) -> Result<(), OpsError> {
-        Ok(self.store.mark_prekeys_uploaded(ids).await?)
+        self.mark_fresh_prekeys_uploaded(ids).await
     }
 
     /// Replace the signed prekey. The old one stays loadable by ID so prekey

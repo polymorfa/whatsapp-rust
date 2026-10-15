@@ -1,5 +1,6 @@
 //! Public upload retries recover from the sealed store, not process memory.
 use async_trait::async_trait;
+use futures::channel::oneshot;
 use futures::executor::block_on;
 use std::sync::{
     Arc, Mutex,
@@ -18,6 +19,7 @@ use wacore_signal_ops::{DeviceKeys, SignalOps};
 const SCOPE: &str = "synthetic-upload-device";
 const PENDING: &str = "prekey-upload-v1";
 const MAX: u32 = 0x00ff_ffff;
+type ReadGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
 #[derive(Default)]
 struct Records {
@@ -26,12 +28,23 @@ struct Records {
     consume: AtomicU32,
     batches: Mutex<Vec<Vec<WriteOp>>>,
     reads: AtomicUsize,
+    pending_read_gate: Mutex<Option<ReadGate>>,
 }
 #[async_trait]
 impl RecordStore for Records {
     async fn get(&self, scope: &str, ns: Namespace, key: &str) -> StoreResult<Option<Vec<u8>>> {
         self.reads.fetch_add(1, Ordering::SeqCst);
-        self.inner.get(scope, ns, key).await
+        let value = self.inner.get(scope, ns, key).await?;
+        let gate = if ns == Namespace::Device && key == PENDING {
+            self.pending_read_gate.lock().unwrap().take()
+        } else {
+            None
+        };
+        if let Some((entered, resume)) = gate {
+            entered.send(()).unwrap();
+            resume.await.unwrap();
+        }
+        Ok(value)
     }
     async fn scan_keys(
         &self,
@@ -197,6 +210,97 @@ impl Fixture {
         }
         Some(self.sealer.open(&aad, &sealed).await.unwrap()[0] == 1)
     }
+}
+
+#[test]
+fn legacy_mark_is_fresh_only_and_rejects_all_original_pending_members_atomically() {
+    block_on(async {
+        let f = Fixture::new().await;
+        let batch = f.ops.prepare_prekey_upload(2).await.unwrap();
+        let fresh = f.ops.generate_prekeys(1).await.unwrap()[0].id;
+        for ids in [vec![1], vec![fresh, 2]] {
+            let writes = f.records.batches.lock().unwrap().len();
+            assert!(matches!(
+                f.ops.mark_prekeys_uploaded(&ids).await,
+                Err(wacore_signal_ops::OpsError::InvalidInput(_))
+            ));
+            assert_eq!(f.records.batches.lock().unwrap().len(), writes);
+            assert_eq!(f.uploaded(fresh).await, Some(false));
+            assert_eq!(f.uploaded(2).await, Some(false));
+        }
+        f.store.remove_prekey(1).await.unwrap();
+        let recovered = f.ops.prepare_prekey_upload(1).await.unwrap();
+        assert_eq!(recovered.pre_keys, batch.pre_keys[1..]);
+        assert!(f.ops.mark_prekeys_uploaded(&[fresh, 1]).await.is_err());
+        assert_eq!(f.uploaded(1).await, None);
+        assert_eq!(f.uploaded(fresh).await, Some(false));
+        f.ops.mark_prekeys_uploaded(&[fresh]).await.unwrap();
+        assert_eq!(f.uploaded(fresh).await, Some(true));
+        assert_eq!(f.ops.prepare_prekey_upload(1).await.unwrap(), recovered);
+        f.ops
+            .acknowledge_prekey_upload(&batch.batch_id, &[1, 2])
+            .await
+            .unwrap();
+        assert_eq!(f.uploaded(1).await, None);
+        assert_eq!(f.uploaded(2).await, Some(true));
+    });
+}
+
+#[test]
+fn legacy_mark_refuses_corrupt_pending_metadata_and_stale_fences() {
+    block_on(async {
+        let f = Fixture::new().await;
+        let fresh = f.ops.generate_prekeys(1).await.unwrap()[0].id;
+        f.store
+            .put_aux(Namespace::Device, PENDING, b"invalid-batch")
+            .await
+            .unwrap();
+        assert!(f.ops.mark_prekeys_uploaded(&[fresh]).await.is_err());
+        assert_eq!(f.uploaded(fresh).await, Some(false));
+        f.store
+            .delete_aux(Namespace::Device, &[PENDING])
+            .await
+            .unwrap();
+        f.records
+            .inner
+            .acquire(SCOPE, "holder-b", 60_001, 60_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            f.ops
+                .mark_prekeys_uploaded(&[fresh])
+                .await
+                .unwrap_err()
+                .is_fence_lost()
+        );
+        assert_eq!(f.uploaded(fresh).await, Some(false));
+    });
+}
+
+#[test]
+fn legacy_mark_and_prepare_share_the_device_mutex() {
+    block_on(async {
+        let f = Fixture::new().await;
+        let (entered, observed) = oneshot::channel();
+        let (resume, wait) = oneshot::channel();
+        *f.records.pending_read_gate.lock().unwrap() = Some((entered, wait));
+        // The mark reads no pending batch, then pauses before its flag write.
+        let mark = f.ops.mark_prekeys_uploaded(&[1]);
+        futures::pin_mut!(mark);
+        assert!(futures::poll!(&mut mark).is_pending());
+        observed.await.unwrap();
+        let prepare = f.ops.prepare_prekey_upload(1);
+        futures::pin_mut!(prepare);
+        assert!(futures::poll!(&mut prepare).is_pending());
+        assert!(f.store.load_prekey(1).await.unwrap().is_none());
+        resume.send(()).unwrap();
+        let (marked, batch) = futures::join!(mark, prepare);
+        marked.unwrap();
+        assert_eq!(batch.unwrap().pre_keys[0].id, 1);
+        // Prepare could not allocate between the guard read and legacy mark.
+        assert_eq!(f.uploaded(1).await, Some(false));
+    });
 }
 
 #[test]
