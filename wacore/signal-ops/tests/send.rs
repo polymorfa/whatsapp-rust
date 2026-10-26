@@ -614,3 +614,45 @@ async fn a_slow_send_does_not_block_receiving_from_another_peer() {
     gate.notify_one();
     send.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn a_corrupt_record_is_pruned_instead_of_stopping_the_prune() {
+    let records = Arc::new(MemoryRecordStore::new());
+    let lease = records
+        .acquire("prune-corrupt", "node-a", 0, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = Arc::new(RecordSignalStore::new(
+        records,
+        Arc::new(AesGcmSealer::new(&[5; 32])),
+        lease.fence,
+    ));
+    let ops = SignalOps::create(store.clone()).await.unwrap();
+    use wacore_recordstore::Namespace;
+    store
+        .put_aux(Namespace::SentMessage, "corrupt", b"x")
+        .await
+        .unwrap();
+    store
+        .put_aux(Namespace::DecryptBuffer, "corrupt", b"x")
+        .await
+        .unwrap();
+    // Cutoff 0 keeps every decodable record, so only the corrupt ones go.
+    assert_eq!(ops.prune_sent_messages(0).await.unwrap(), 1);
+    assert_eq!(ops.prune_decrypt_buffer(0).await.unwrap(), 1);
+    assert!(
+        store
+            .load_aux(Namespace::SentMessage, "corrupt")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .load_aux(Namespace::DecryptBuffer, "corrupt")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

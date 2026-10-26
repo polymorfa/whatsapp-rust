@@ -601,8 +601,10 @@ impl<S: ServiceStore> SignalOps<S> {
         let store = self.store();
         let mut expired = Vec::new();
         for key in store.scan_aux(Namespace::SentMessage, "").await? {
+            // A record that no longer decodes cannot serve a resend; delete it
+            // rather than let one corrupt entry stop every later prune.
             if let Some(record) = store.load_aux(Namespace::SentMessage, &key).await?
-                && decode_sent(&record)?.0 < cutoff_ms
+                && decode_sent(&record).map_or(true, |(sent_ms, _)| sent_ms < cutoff_ms)
             {
                 expired.push(key);
             }

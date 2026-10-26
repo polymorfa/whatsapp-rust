@@ -333,8 +333,10 @@ impl<S: ServiceStore> SignalOps<S> {
         let store = self.store();
         let mut expired = Vec::new();
         for key in store.scan_aux(Namespace::DecryptBuffer, "").await? {
+            // An entry that no longer decodes cannot answer a replay; delete it
+            // rather than let one corrupt entry stop every later prune.
             if let Some(bytes) = store.load_aux(Namespace::DecryptBuffer, &key).await?
-                && BufferEntry::decode(bytes)?.inserted_ms < cutoff_ms
+                && BufferEntry::decode(bytes).map_or(true, |entry| entry.inserted_ms < cutoff_ms)
             {
                 expired.push(key);
             }

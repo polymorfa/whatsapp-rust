@@ -360,6 +360,14 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
 
     /// Reserve fresh prekey IDs without overwriting an existing private key.
     pub async fn insert_prekeys_batch(&self, keys: &[(u32, Bytes)]) -> Result<()> {
+        // A repeated ID would replace the first staged insert, so commit would
+        // succeed with fewer private keys stored than the caller supplied.
+        let mut seen = std::collections::HashSet::with_capacity(keys.len());
+        if let Some((id, _)) = keys.iter().find(|(id, _)| !seen.insert(*id)) {
+            return Err(StoreError::Validation(format!(
+                "prekey batch repeats id {id}"
+            )));
+        }
         self.apply(
             keys.iter()
                 .map(|(id, record)| {
@@ -734,6 +742,22 @@ mod tests {
             lease.fence,
         );
         (records, store)
+    }
+
+    #[test]
+    fn a_prekey_batch_with_a_repeated_id_is_refused_whole() {
+        let (_, store) = setup();
+        let keys = [
+            (7, Bytes::from_static(b"a")),
+            (8, Bytes::from_static(b"b")),
+            (7, Bytes::from_static(b"c")),
+        ];
+        assert!(matches!(
+            block_on(store.insert_prekeys_batch(&keys)),
+            Err(StoreError::Validation(_))
+        ));
+        assert_eq!(block_on(store.load_prekey(7)).unwrap(), None);
+        assert_eq!(block_on(store.load_prekey(8)).unwrap(), None);
     }
 
     #[test]
