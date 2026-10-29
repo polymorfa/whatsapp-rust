@@ -24,6 +24,12 @@ ignore = [
     # Compile-time macro dependency of OxiTLS. It contributes no runtime code,
     # and the current provider has no replacement release without it.
     "RUSTSEC-2024-0436",
+    # crypto-bigint 0.5 timing variability. Reached only through OxiTLS's
+    # RustCrypto provider (p256/p384 via elliptic-curve 0.13) in wa-fetch, which
+    # only the tools/oracle-task research tool uses; no shipped crate links it.
+    # The fix needs crypto-bigint 0.7 (elliptic-curve 0.14), which the
+    # git-pinned wa-fetch provider cannot take yet.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]

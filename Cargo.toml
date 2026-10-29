@@ -42,6 +42,9 @@ members = [
     "wacore/derive",
     "wacore/libsignal",
     "wacore/noise",
+    "wacore/recordstore",
+    "wacore/signal-ops",
+    "wacore/signal-wasm",
     "waproto",
 ]
 default-members = [
@@ -55,6 +58,8 @@ default-members = [
     "wacore/derive",
     "wacore/libsignal",
     "wacore/noise",
+    "wacore/recordstore",
+    "wacore/signal-ops",
     "waproto",
 ]
 
