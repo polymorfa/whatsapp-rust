@@ -20,9 +20,16 @@
 //! marks only those fresh keys and rejects pending upload members atomically.
 //! These operations use the scope's fenced store;
 //! upload batch IDs remain reserved across 24-bit wrap even after consumption.
+//!
+//! Dropping a state-changing operation before completion retires that
+//! `SignalOps` instance before its locks are released. Submitted backend writes
+//! may still finish, so callers must release its lease and open a new instance
+//! with a higher fence, not reopen at the same generation. [`SignalOps::is_usable`]
+//! exposes this state; later mutations report [`OpsError::is_fence_lost`].
 
 mod device;
 mod error;
+mod guard;
 mod inbound;
 mod ops;
 mod outbound;

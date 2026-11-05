@@ -200,109 +200,116 @@ impl<S: ServiceStore> SignalOps<S> {
             ReceiveKind::SenderKey => vec![chain],
             _ => vec![session_key(request.sender), chain],
         };
-        let _held = self.lock_keys(keys).await;
-
-        if let Some(bytes) = self
-            .store()
-            .load_aux(Namespace::DecryptBuffer, &receipt_key)
-            .await?
-        {
-            let entry = BufferEntry::decode(bytes)?;
-            if entry.state == STATE_DELIVERED {
-                return Ok(Received::AlreadyDelivered { receipt_key });
+        let held = self.lock_keys(keys).await?;
+        held.run(async {
+            if let Some(bytes) = self
+                .store()
+                .load_aux(Namespace::DecryptBuffer, &receipt_key)
+                .await?
+            {
+                let entry = BufferEntry::decode(bytes)?;
+                if entry.state == STATE_DELIVERED {
+                    return Ok(Received::AlreadyDelivered { receipt_key });
+                }
+                let content = classify(
+                    &entry.padded_plaintext,
+                    entry.padding_version,
+                    request.is_from_me,
+                )?;
+                return Ok(Received::Message(Box::new(ReceivedMessage {
+                    app_state_key_share: key_share(&content, request.is_from_me),
+                    receipt_key,
+                    content,
+                    identity_changed: entry.identity_changed,
+                    redelivered: true,
+                    sender_key_rejected: false,
+                })));
             }
-            let content = classify(
-                &entry.padded_plaintext,
-                entry.padding_version,
-                request.is_from_me,
-            )?;
-            return Ok(Received::Message(Box::new(ReceivedMessage {
+
+            let staged = Arc::new(self.store().staged());
+            let (padded, identity_changed) = match request.kind {
+                ReceiveKind::PreKey | ReceiveKind::Message => {
+                    let kind = if request.kind == ReceiveKind::PreKey {
+                        EncKind::PreKey
+                    } else {
+                        EncKind::Message
+                    };
+                    let decrypted = self
+                        .decrypt_into(&staged, request.sender, kind, request.ciphertext)
+                        .await?;
+                    (decrypted.plaintext, decrypted.identity_changed)
+                }
+                ReceiveKind::SenderKey => (
+                    self.group_decrypt_into(
+                        &staged,
+                        request.chat,
+                        request.sender,
+                        request.ciphertext,
+                    )
+                    .await?,
+                    false,
+                ),
+            };
+
+            let inserted_ms = now_ms();
+            let content = match classify(&padded, request.padding_version, request.is_from_me) {
+                Ok(content) => content,
+                Err(error) => {
+                    // The ratchet already advanced; keep that, and record the
+                    // ciphertext as handled so redelivery does not loop.
+                    staged
+                        .put_aux(
+                            Namespace::DecryptBuffer,
+                            &receipt_key,
+                            &BufferEntry::delivered(inserted_ms).encode(),
+                        )
+                        .await?;
+                    staged.commit().await?;
+                    return Err(error);
+                }
+            };
+
+            // A bad distribution must not block the message carrying it: failing
+            // here would discard the ratchet advance, and every redelivery would
+            // fail the same way. The client logs and continues the same way.
+            let mut sender_key_rejected = false;
+            if let Some(skdm) = &content.skdm
+                && let Some(axolotl) = &skdm.axolotl_sender_key_distribution_message
+                && self
+                    .process_sender_key_distribution_into(
+                        &staged,
+                        request.chat,
+                        request.sender,
+                        axolotl,
+                    )
+                    .await
+                    .is_err()
+            {
+                sender_key_rejected = true;
+            }
+
+            let entry = BufferEntry {
+                state: STATE_PENDING,
+                padding_version: request.padding_version,
+                identity_changed,
+                inserted_ms,
+                padded_plaintext: padded,
+            };
+            staged
+                .put_aux(Namespace::DecryptBuffer, &receipt_key, &entry.encode())
+                .await?;
+            staged.commit().await?;
+
+            Ok(Received::Message(Box::new(ReceivedMessage {
                 app_state_key_share: key_share(&content, request.is_from_me),
                 receipt_key,
                 content,
-                identity_changed: entry.identity_changed,
-                redelivered: true,
-                sender_key_rejected: false,
-            })));
-        }
-
-        let staged = Arc::new(self.store().staged());
-        let (padded, identity_changed) = match request.kind {
-            ReceiveKind::PreKey | ReceiveKind::Message => {
-                let kind = if request.kind == ReceiveKind::PreKey {
-                    EncKind::PreKey
-                } else {
-                    EncKind::Message
-                };
-                let decrypted = self
-                    .decrypt_into(&staged, request.sender, kind, request.ciphertext)
-                    .await?;
-                (decrypted.plaintext, decrypted.identity_changed)
-            }
-            ReceiveKind::SenderKey => (
-                self.group_decrypt_into(&staged, request.chat, request.sender, request.ciphertext)
-                    .await?,
-                false,
-            ),
-        };
-
-        let inserted_ms = now_ms();
-        let content = match classify(&padded, request.padding_version, request.is_from_me) {
-            Ok(content) => content,
-            Err(error) => {
-                // The ratchet already advanced; keep that, and record the
-                // ciphertext as handled so redelivery does not loop.
-                staged
-                    .put_aux(
-                        Namespace::DecryptBuffer,
-                        &receipt_key,
-                        &BufferEntry::delivered(inserted_ms).encode(),
-                    )
-                    .await?;
-                staged.commit().await?;
-                return Err(error);
-            }
-        };
-
-        // A bad distribution must not block the message carrying it: failing
-        // here would discard the ratchet advance, and every redelivery would
-        // fail the same way. The client logs and continues the same way.
-        let mut sender_key_rejected = false;
-        if let Some(skdm) = &content.skdm
-            && let Some(axolotl) = &skdm.axolotl_sender_key_distribution_message
-            && self
-                .process_sender_key_distribution_into(
-                    &staged,
-                    request.chat,
-                    request.sender,
-                    axolotl,
-                )
-                .await
-                .is_err()
-        {
-            sender_key_rejected = true;
-        }
-
-        let entry = BufferEntry {
-            state: STATE_PENDING,
-            padding_version: request.padding_version,
-            identity_changed,
-            inserted_ms,
-            padded_plaintext: padded,
-        };
-        staged
-            .put_aux(Namespace::DecryptBuffer, &receipt_key, &entry.encode())
-            .await?;
-        staged.commit().await?;
-
-        Ok(Received::Message(Box::new(ReceivedMessage {
-            app_state_key_share: key_share(&content, request.is_from_me),
-            receipt_key,
-            content,
-            identity_changed,
-            redelivered: false,
-            sender_key_rejected,
-        })))
+                identity_changed,
+                redelivered: false,
+                sender_key_rejected,
+            })))
+        })
+        .await
     }
 
     /// The app has the message: drop its plaintext and keep a marker so a

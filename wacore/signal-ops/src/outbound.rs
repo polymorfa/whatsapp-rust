@@ -19,7 +19,7 @@ use wacore::runtime::Runtime;
 use wacore::send::{
     DmSignalAddressing, DmStanzaRequest, GroupStanzaRequest, ResolvedDmDevices,
     ResolvedGroupDevices, SenderKeyDistributionPolicy, SignalStores, prepare_dm_stanza,
-    prepare_group_stanza, retain_skdm_distribution_targets,
+    prepare_group_stanza_resolved, retain_skdm_distribution_targets,
 };
 use wacore::send::{PairwiseRetryDestination, PairwiseRetryRequest, prepare_pairwise_retry_stanza};
 use wacore::types::jid::JidExt as _;
@@ -227,60 +227,63 @@ impl<S: ServiceStore> SignalOps<S> {
             .map(|jid| session_key(&jid.to_protocol_address()))
             .collect();
         let _ = resolved.signal_addressing_or_init(DmSignalAddressing::new(encryption, lock_jids));
-        let _held = self.lock_keys(held_keys).await;
-        let staged = std::sync::Arc::new(self.store().staged());
-        let stores = self.stores_over(staged.clone()).await;
-        let (mut sender_keys, mut sessions, mut identities, mut prekeys, signed_prekeys) = (
-            stores.clone(),
-            stores.clone(),
-            stores.clone(),
-            stores.clone(),
-            stores,
-        );
-        let mut signal = SignalStores {
-            sender_key_store: &mut sender_keys,
-            session_store: &mut sessions,
-            identity_store: &mut identities,
-            prekey_store: &mut prekeys,
-            signed_prekey_store: &signed_prekeys,
-        };
-        let prepared = prepare_dm_stanza(
-            runtime,
-            &mut signal,
-            resolver,
-            DmStanzaRequest {
-                own_jid: &own_jid,
-                own_lid: own_lid.as_ref(),
-                account: account.as_ref(),
-                to,
-                message,
-                message_id,
-                edit: None,
-                extra_nodes: &[],
-                devices: &resolved,
-                pre_encoded: None,
-            },
-        )
-        .await
-        .map_err(send_error)?;
-
-        let encoded = waproto::codec::message_to_vec(message);
-        staged
-            .put_aux(
-                Namespace::SentMessage,
-                &sent_key(to, message_id),
-                &encode_sent(&encoded, prepared.message_secret.as_ref()),
+        let held = self.lock_keys(held_keys).await?;
+        held.run(async {
+            let staged = std::sync::Arc::new(self.store().staged());
+            let stores = self.stores_over(staged.clone()).await;
+            let (mut sender_keys, mut sessions, mut identities, mut prekeys, signed_prekeys) = (
+                stores.clone(),
+                stores.clone(),
+                stores.clone(),
+                stores.clone(),
+                stores,
+            );
+            let mut signal = SignalStores {
+                sender_key_store: &mut sender_keys,
+                session_store: &mut sessions,
+                identity_store: &mut identities,
+                prekey_store: &mut prekeys,
+                signed_prekey_store: &signed_prekeys,
+            };
+            let prepared = prepare_dm_stanza(
+                runtime,
+                &mut signal,
+                resolver,
+                DmStanzaRequest {
+                    own_jid: &own_jid,
+                    own_lid: own_lid.as_ref(),
+                    account: account.as_ref(),
+                    to,
+                    message,
+                    message_id,
+                    edit: None,
+                    extra_nodes: &[],
+                    devices: &resolved,
+                    pre_encoded: None,
+                },
             )
-            .await?;
-        staged.commit().await?;
+            .await
+            .map_err(send_error)?;
 
-        let stanza = wacore_binary::marshal(&prepared.node)
-            .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))?;
-        Ok(PreparedSend {
-            stanza,
-            unreached_devices: prepared.unreached_devices,
-            phash: prepared.phash.map(|p| p.to_string()),
+            let encoded = waproto::codec::message_to_vec(message);
+            staged
+                .put_aux(
+                    Namespace::SentMessage,
+                    &sent_key(to, message_id),
+                    &encode_sent(&encoded, prepared.message_secret.as_ref()),
+                )
+                .await?;
+            staged.commit().await?;
+
+            let stanza = wacore_binary::marshal(&prepared.node)
+                .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))?;
+            Ok(PreparedSend {
+                stanza,
+                unreached_devices: prepared.unreached_devices,
+                phash: prepared.phash.map(|p| p.to_string()),
+            })
         })
+        .await
     }
 
     /// The message this device sent to `chat` with `message_id`, if still
@@ -331,153 +334,179 @@ impl<S: ServiceStore> SignalOps<S> {
         let own_lid = own_lid.ok_or_else(|| {
             OpsError::InvalidInput("group sends need this device's LID; call set_own_jids".into())
         })?;
-        let routing = resolver
-            .resolve_group_routing_info(group)
-            .await
-            .map_err(send_error)?;
-        let is_lid_mode = routing.addressing_mode == AddressingMode::Lid;
-        let own_sending = if is_lid_mode { &own_lid } else { &own_jid };
-
-        // Same device query as the client's resolve_group_devices: LID-mode
-        // members are queried by phone number, then mapped back.
-        let mut queries: Vec<Jid> = routing
-            .participants
-            .iter()
-            .map(|jid| {
-                if is_lid_mode
-                    && jid.is_lid()
-                    && let Some(pn) = routing.phone_jid_for_lid_user(&jid.user)
-                {
-                    return pn.to_non_ad();
-                }
-                jid.to_non_ad()
-            })
-            .collect();
-        if !routing
-            .participants
-            .iter()
-            .any(|participant| participant.is_same_user_as(own_sending))
-        {
-            queries.push(own_jid.to_non_ad());
-        }
-        let mut devices = resolver
-            .resolve_devices(&queries)
-            .await
-            .map_err(send_error)?;
-        if is_lid_mode {
-            devices = devices
-                .into_iter()
-                .map(|device| routing.phone_device_jid_into_lid(device))
-                .collect();
-        }
-        wacore::types::jid::sort_dedup_by_device(&mut devices);
-        let addressed = ResolvedGroupDevices::new(devices);
-
         let group_str = group.to_string();
-        let mut held_keys = vec![
-            chain_key(&group_str, own_sending.to_protocol_address().as_str()),
-            group_key(&group_str),
-        ];
-        for device in addressed.devices() {
-            held_keys.push(session_key(&device.to_protocol_address()));
-            held_keys.push(session_key(
-                &encryption_jid(resolver, device).await.to_protocol_address(),
-            ));
-        }
-        let _held = self.lock_keys(held_keys).await;
-        let own_chain =
-            SenderKeyName::from_parts(&group_str, own_sending.to_protocol_address().as_str());
-        // A missing chain means a fresh key: everyone needs it, as in the
-        // client's force_skdm path.
-        let force = self
-            .store()
-            .get_sender_key(own_chain.cache_key())
-            .await?
-            .is_none();
-        let targets = if force {
-            let mut all = addressed.devices().to_vec();
-            retain_skdm_distribution_targets(&mut all, own_sending);
-            all
-        } else {
-            let warm: HashSet<String> = self
-                .store()
-                .scan_aux(Namespace::SenderKeyDevices, &format!("{group_str}\u{0}"))
-                .await?
-                .into_iter()
-                .collect();
-            let is_warm = |jid: &Jid| warm.contains(&sender_key_device_key(&group_str, jid));
-            addressed
-                .devices()
+        // Resolve membership while holding the rotation locks. A send that
+        // began before a removal may finish on the old chain, but cannot
+        // distribute a replacement chain using its old membership snapshot.
+        // g:/k: locks precede every s: lock in the common ordering.
+        let held = self
+            .lock_keys(vec![
+                group_key(&group_str),
+                chain_key(&group_str, own_jid.to_protocol_address().as_str()),
+                chain_key(&group_str, own_lid.to_protocol_address().as_str()),
+            ])
+            .await?;
+        held.run(async {
+            let routing = resolver
+                .resolve_group_routing_info(group)
+                .await
+                .map_err(send_error)?;
+            let is_lid_mode = routing.addressing_mode == AddressingMode::Lid;
+            let own_sending = if is_lid_mode { &own_lid } else { &own_jid };
+
+            // Same device query as the client's resolve_group_devices: LID-mode
+            // members are queried by phone number, then mapped back.
+            let mut queries: Vec<Jid> = routing
+                .participants
                 .iter()
-                .filter(|device| {
-                    !(device.is_hosted()
+                .map(|jid| {
+                    if is_lid_mode
+                        && jid.is_lid()
+                        && let Some(pn) = routing.phone_jid_for_lid_user(&jid.user)
+                    {
+                        return pn.to_non_ad();
+                    }
+                    jid.to_non_ad()
+                })
+                .collect();
+            if !routing
+                .participants
+                .iter()
+                .any(|participant| participant.is_same_user_as(own_sending))
+            {
+                queries.push(own_jid.to_non_ad());
+            }
+            let mut devices = resolver
+                .resolve_devices(&queries)
+                .await
+                .map_err(send_error)?;
+            if is_lid_mode {
+                devices = devices
+                    .into_iter()
+                    .map(|device| routing.phone_device_jid_into_lid(device))
+                    .collect();
+            }
+            wacore::types::jid::sort_dedup_by_device(&mut devices);
+            let addressed = ResolvedGroupDevices::new(devices);
+
+            let mut held_keys = Vec::new();
+            let mut signal_addresses = std::collections::HashMap::new();
+            for device in addressed.devices() {
+                let encryption = encryption_jid(resolver, device).await;
+                held_keys.push(session_key(&device.to_protocol_address()));
+                held_keys.push(session_key(&encryption.to_protocol_address()));
+                signal_addresses.insert(device.clone(), encryption);
+            }
+            let session_held = self.lock_keys(held_keys).await?;
+            session_held
+                .run(async {
+                    let own_chain = SenderKeyName::from_parts(
+                        &group_str,
+                        own_sending.to_protocol_address().as_str(),
+                    );
+                    // A missing chain means a fresh key: everyone needs it, as in the
+                    // client's force_skdm path.
+                    let force = self
+                        .store()
+                        .get_sender_key(own_chain.cache_key())
+                        .await?
+                        .is_none();
+                    let targets = if force {
+                        let mut all = addressed.devices().to_vec();
+                        retain_skdm_distribution_targets(&mut all, own_sending);
+                        all
+                    } else {
+                        let warm: HashSet<String> = self
+                            .store()
+                            .scan_aux(Namespace::SenderKeyDevices, &format!("{group_str}\u{0}"))
+                            .await?
+                            .into_iter()
+                            .collect();
+                        let is_warm =
+                            |jid: &Jid| warm.contains(&sender_key_device_key(&group_str, jid));
+                        addressed
+                            .devices()
+                            .iter()
+                            .filter(|device| {
+                                !(device.is_hosted()
                         || device.user == own_sending.user && device.device == own_sending.device
                         // WA Web treats a companion as warm only if its
                         // primary (device 0) is too.
                         || is_warm(device) && is_warm(&device.with_device(0)))
+                            })
+                            .cloned()
+                            .collect()
+                    };
+
+                    let staged = std::sync::Arc::new(self.store().staged());
+                    let stores = self.stores_over(staged.clone()).await;
+                    let (
+                        mut sender_keys,
+                        mut sessions,
+                        mut identities,
+                        mut prekeys,
+                        signed_prekeys,
+                    ) = (
+                        stores.clone(),
+                        stores.clone(),
+                        stores.clone(),
+                        stores.clone(),
+                        stores,
+                    );
+                    let mut signal = SignalStores {
+                        sender_key_store: &mut sender_keys,
+                        session_store: &mut sessions,
+                        identity_store: &mut identities,
+                        prekey_store: &mut prekeys,
+                        signed_prekey_store: &signed_prekeys,
+                    };
+                    let prepared = prepare_group_stanza_resolved(
+                        runtime,
+                        &mut signal,
+                        resolver,
+                        GroupStanzaRequest {
+                            group: &routing,
+                            own_jid: &own_jid,
+                            own_lid: &own_lid,
+                            account: account.as_ref(),
+                            to: group,
+                            message,
+                            message_id,
+                            force_distribution: force,
+                            distribution_targets: Some(targets),
+                            distribution_policy: SenderKeyDistributionPolicy::BestEffort,
+                            phash_devices: Some(&addressed),
+                            edit: None,
+                            extra_nodes: &[],
+                            pre_encoded: None,
+                        },
+                        Some(&signal_addresses),
+                    )
+                    .await
+                    .map_err(send_error)?;
+
+                    let encoded = waproto::codec::message_to_vec(message);
+                    staged
+                        .put_aux(
+                            Namespace::SentMessage,
+                            &sent_key(group, message_id),
+                            &encode_sent(&encoded, prepared.message_secret.as_ref()),
+                        )
+                        .await?;
+                    staged.commit().await?;
+
+                    let stanza = wacore_binary::marshal(&prepared.node)
+                        .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))?;
+                    Ok(PreparedGroupSend {
+                        stanza,
+                        distribution_targets: prepared.skdm_devices,
+                        stale_device_users: prepared.stale_device_users,
+                        phash: prepared.phash.map(|p| p.to_string()),
+                    })
                 })
-                .cloned()
-                .collect()
-        };
-
-        let staged = std::sync::Arc::new(self.store().staged());
-        let stores = self.stores_over(staged.clone()).await;
-        let (mut sender_keys, mut sessions, mut identities, mut prekeys, signed_prekeys) = (
-            stores.clone(),
-            stores.clone(),
-            stores.clone(),
-            stores.clone(),
-            stores,
-        );
-        let mut signal = SignalStores {
-            sender_key_store: &mut sender_keys,
-            session_store: &mut sessions,
-            identity_store: &mut identities,
-            prekey_store: &mut prekeys,
-            signed_prekey_store: &signed_prekeys,
-        };
-        let prepared = prepare_group_stanza(
-            runtime,
-            &mut signal,
-            resolver,
-            GroupStanzaRequest {
-                group: &routing,
-                own_jid: &own_jid,
-                own_lid: &own_lid,
-                account: account.as_ref(),
-                to: group,
-                message,
-                message_id,
-                force_distribution: force,
-                distribution_targets: Some(targets),
-                distribution_policy: SenderKeyDistributionPolicy::BestEffort,
-                phash_devices: Some(&addressed),
-                edit: None,
-                extra_nodes: &[],
-                pre_encoded: None,
-            },
-        )
-        .await
-        .map_err(send_error)?;
-
-        let encoded = waproto::codec::message_to_vec(message);
-        staged
-            .put_aux(
-                Namespace::SentMessage,
-                &sent_key(group, message_id),
-                &encode_sent(&encoded, prepared.message_secret.as_ref()),
-            )
-            .await?;
-        staged.commit().await?;
-
-        let stanza = wacore_binary::marshal(&prepared.node)
-            .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))?;
-        Ok(PreparedGroupSend {
-            stanza,
-            distribution_targets: prepared.skdm_devices,
-            stale_device_users: prepared.stale_device_users,
-            phash: prepared.phash.map(|p| p.to_string()),
+                .await
         })
+        .await
     }
 
     /// Record that the server acked a group send whose stanza carried the
@@ -490,22 +519,25 @@ impl<S: ServiceStore> SignalOps<S> {
     ) -> Result<(), OpsError> {
         let OwnIdentity { pn, lid, .. } = self.own_identity().await?;
         let group_str = group.to_string();
-        let _held = self.lock_keys(vec![group_key(&group_str)]).await;
-        for device in devices {
-            if device.is_same_user_as(&pn)
-                || lid.as_ref().is_some_and(|l| device.is_same_user_as(l))
-            {
-                continue;
+        let held = self.lock_keys(vec![group_key(&group_str)]).await?;
+        held.run(async {
+            for device in devices {
+                if device.is_same_user_as(&pn)
+                    || lid.as_ref().is_some_and(|l| device.is_same_user_as(l))
+                {
+                    continue;
+                }
+                self.store()
+                    .put_aux(
+                        Namespace::SenderKeyDevices,
+                        &sender_key_device_key(&group_str, device),
+                        &[1],
+                    )
+                    .await?;
             }
-            self.store()
-                .put_aux(
-                    Namespace::SenderKeyDevices,
-                    &sender_key_device_key(&group_str, device),
-                    &[1],
-                )
-                .await?;
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     /// Rotate this device's PN and LID sender-key chains and clear distribution
@@ -524,22 +556,25 @@ impl<S: ServiceStore> SignalOps<S> {
                 .iter()
                 .map(|address| chain_key(&group_str, address.as_str())),
         );
-        let _held = self.lock_keys(held_keys).await;
-        let staged = self.store().staged();
-        for address in addresses {
-            let name = SenderKeyName::from_parts(&group_str, address.as_str());
-            staged.delete_sender_key(name.cache_key()).await?;
-        }
-        let prefix = format!("{group}\u{0}");
-        let keys = staged
-            .scan_aux(Namespace::SenderKeyDevices, &prefix)
-            .await?;
-        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        staged
-            .delete_aux(Namespace::SenderKeyDevices, &refs)
-            .await?;
-        staged.commit().await?;
-        Ok(())
+        let held = self.lock_keys(held_keys).await?;
+        held.run(async {
+            let staged = self.store().staged();
+            for address in addresses {
+                let name = SenderKeyName::from_parts(&group_str, address.as_str());
+                staged.delete_sender_key(name.cache_key()).await?;
+            }
+            let prefix = format!("{group}\u{0}");
+            let keys = staged
+                .scan_aux(Namespace::SenderKeyDevices, &prefix)
+                .await?;
+            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            staged
+                .delete_aux(Namespace::SenderKeyDevices, &refs)
+                .await?;
+            staged.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Re-encrypt a sent message for the device that asked for it. Without a
@@ -564,79 +599,82 @@ impl<S: ServiceStore> SignalOps<S> {
         if matches!(request.route, RetryRoute::Group { .. }) {
             held_keys.push(group_key(&request.chat.to_string()));
         }
-        let _held = self.lock_keys(held_keys).await;
-        if matches!(request.route, RetryRoute::Group { .. }) {
-            let group = request.chat.to_string();
-            let keys: Vec<String> = [request.requester, request.encryption_jid]
-                .into_iter()
-                .map(|jid| sender_key_device_key(&group, jid))
-                .collect();
-            let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            self.store()
-                .delete_aux(Namespace::SenderKeyDevices, &refs)
+        let held = self.lock_keys(held_keys).await?;
+        held.run(async {
+            if matches!(request.route, RetryRoute::Group { .. }) {
+                let group = request.chat.to_string();
+                let keys: Vec<String> = [request.requester, request.encryption_jid]
+                    .into_iter()
+                    .map(|jid| sender_key_device_key(&group, jid))
+                    .collect();
+                let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+                self.store()
+                    .delete_aux(Namespace::SenderKeyDevices, &refs)
+                    .await?;
+            }
+            let staged = std::sync::Arc::new(self.store().staged());
+            if let Some(bundle) = request.bundle {
+                self.establish_into(&staged, &address, bundle).await?;
+            } else if !staged.has_session(address.as_str()).await? {
+                let fetched = resolver
+                    .fetch_prekeys(std::slice::from_ref(request.encryption_jid))
+                    .await
+                    .map_err(send_error)?;
+                let bundle = fetched.get(request.encryption_jid).ok_or_else(|| {
+                    OpsError::Send("no session and no prekey bundle for the requester".into())
+                })?;
+                let mut sessions = self.stores_over(staged.clone()).await;
+                let mut identities = sessions.clone();
+                process_prekey_bundle(
+                    &address,
+                    &mut sessions,
+                    &mut identities,
+                    bundle,
+                    &mut rand::make_rng::<rand::rngs::StdRng>(),
+                    UsePQRatchet::No,
+                )
                 .await?;
-        }
-        let staged = std::sync::Arc::new(self.store().staged());
-        if let Some(bundle) = request.bundle {
-            self.establish_into(&staged, &address, bundle).await?;
-        } else if !staged.has_session(address.as_str()).await? {
-            let fetched = resolver
-                .fetch_prekeys(std::slice::from_ref(request.encryption_jid))
-                .await
-                .map_err(send_error)?;
-            let bundle = fetched.get(request.encryption_jid).ok_or_else(|| {
-                OpsError::Send("no session and no prekey bundle for the requester".into())
-            })?;
+            }
+
+            let destination = match request.route {
+                RetryRoute::Direct { recipient } => PairwiseRetryDestination::Direct {
+                    to: request.requester.clone(),
+                    recipient,
+                },
+                RetryRoute::Group { addressing_mode } => PairwiseRetryDestination::Participant {
+                    to: request.chat.clone(),
+                    participant: request.requester.clone(),
+                    addressing_mode: Some(addressing_mode),
+                },
+                RetryRoute::BroadcastList => PairwiseRetryDestination::Participant {
+                    to: request.chat.clone(),
+                    participant: request.requester.clone(),
+                    addressing_mode: None,
+                },
+            };
             let mut sessions = self.stores_over(staged.clone()).await;
             let mut identities = sessions.clone();
-            process_prekey_bundle(
-                &address,
+            let node = prepare_pairwise_retry_stanza(
                 &mut sessions,
                 &mut identities,
-                bundle,
-                &mut rand::make_rng::<rand::rngs::StdRng>(),
-                UsePQRatchet::No,
+                PairwiseRetryRequest {
+                    destination,
+                    encryption_jid: request.encryption_jid.clone(),
+                    message: &message,
+                    message_id: request.message_id.to_owned(),
+                    retry_count: request.retry_count,
+                    account: account.as_ref(),
+                    edit: EditAttribute::infer_from_message(&message),
+                    pre_encoded: None,
+                },
             )
-            .await?;
-        }
-
-        let destination = match request.route {
-            RetryRoute::Direct { recipient } => PairwiseRetryDestination::Direct {
-                to: request.requester.clone(),
-                recipient,
-            },
-            RetryRoute::Group { addressing_mode } => PairwiseRetryDestination::Participant {
-                to: request.chat.clone(),
-                participant: request.requester.clone(),
-                addressing_mode: Some(addressing_mode),
-            },
-            RetryRoute::BroadcastList => PairwiseRetryDestination::Participant {
-                to: request.chat.clone(),
-                participant: request.requester.clone(),
-                addressing_mode: None,
-            },
-        };
-        let mut sessions = self.stores_over(staged.clone()).await;
-        let mut identities = sessions.clone();
-        let node = prepare_pairwise_retry_stanza(
-            &mut sessions,
-            &mut identities,
-            PairwiseRetryRequest {
-                destination,
-                encryption_jid: request.encryption_jid.clone(),
-                message: &message,
-                message_id: request.message_id.to_owned(),
-                retry_count: request.retry_count,
-                account: account.as_ref(),
-                edit: EditAttribute::infer_from_message(&message),
-                pre_encoded: None,
-            },
-        )
+            .await
+            .map_err(send_error)?;
+            staged.commit().await?;
+            wacore_binary::marshal(&node)
+                .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))
+        })
         .await
-        .map_err(send_error)?;
-        staged.commit().await?;
-        wacore_binary::marshal(&node)
-            .map_err(|e| OpsError::Send(format!("stanza did not marshal: {e}")))
     }
 
     /// Delete sent-message records inserted before `cutoff_ms`; a retry

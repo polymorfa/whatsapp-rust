@@ -25,7 +25,10 @@ pub fn coded_error(code: &str, message: &str) -> JsValue {
 
 pub fn ops_error(error: OpsError) -> JsValue {
     if error.is_fence_lost() {
-        return coded_error("fence_lost", "another holder took this scope");
+        return coded_error(
+            "fence_lost",
+            "this Signal state is no longer usable; acquire a fresh lease",
+        );
     }
     match error {
         OpsError::Pairing { code, text } => {

@@ -95,15 +95,28 @@ pub struct GroupStanzaRequest<'a> {
     pub pre_encoded: Option<&'a [u8]>,
 }
 
-#[cfg_attr(
-    feature = "tracing",
-    tracing::instrument(name = "wa.send.group_prepare", level = "debug", skip_all, err(Debug))
-)]
 pub async fn prepare_group_stanza(
     runtime: &dyn Runtime,
     stores: &mut SignalStores<'_>,
     resolver: &dyn SendContextResolver,
     request: GroupStanzaRequest<'_>,
+) -> Result<PreparedGroupStanza> {
+    prepare_group_stanza_resolved(runtime, stores, resolver, request, None).await
+}
+
+/// Prepare a group send with optional frozen device-to-Signal addresses.
+/// When supplied, the map must cover every distribution target; missing
+/// entries fail rather than looking up a mapping outside the caller's locks.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(name = "wa.send.group_prepare", level = "debug", skip_all, err(Debug))
+)]
+pub async fn prepare_group_stanza_resolved(
+    runtime: &dyn Runtime,
+    stores: &mut SignalStores<'_>,
+    resolver: &dyn SendContextResolver,
+    request: GroupStanzaRequest<'_>,
+    signal_addresses: Option<&std::collections::HashMap<Jid, Jid>>,
 ) -> Result<PreparedGroupStanza> {
     let GroupStanzaRequest {
         group: group_info,
@@ -346,12 +359,31 @@ pub async fn prepare_group_stanza(
     // group message from being sent.
     let session_plan = match distribution_list.as_deref() {
         Some(list) => {
+            let addresses = signal_addresses
+                .map(|addresses| {
+                    list.iter()
+                        .map(|device| {
+                            addresses.get(device).cloned().ok_or_else(|| {
+                                anyhow!("a pre-resolved group encryption address is missing")
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?;
             let setup_lock = stores
                 .sender_key_store
                 .session_setup_lock(&sender_key_name)
                 .await;
             let _setup_guard = setup_lock.lock().await;
-            match ensure_sessions_for_devices(runtime, stores, resolver, list).await {
+            match ensure_sessions_for_devices_resolved(
+                runtime,
+                stores,
+                resolver,
+                list,
+                addresses.as_deref(),
+            )
+            .await
+            {
                 Ok(plan) => Some(plan),
                 Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
                     return Err(error.context("required sender-key session setup failed"));

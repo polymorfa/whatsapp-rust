@@ -131,35 +131,38 @@ impl<S: ServiceStore> SignalOps<S> {
     /// allocation exhaustion at that bound leaves the counter and keys unchanged.
     pub async fn prepare_prekey_upload(&self, count: u32) -> Result<PreKeyUploadBatch, OpsError> {
         count_valid(count)?;
-        let _held = self.device_write.lock().await;
-        if let Some(batch) = self.pending_upload().await? {
-            let live = self.live_upload_keys(&batch).await?;
-            let staged = self.store.staged();
-            if !live.is_empty() {
-                // A fenced write also refuses a superseded holder before any
-                // public batch is returned, including a recovered one.
-                staged
-                    .put_aux(Namespace::Device, PENDING, &batch.encode()?)
-                    .await?;
+        let held = self.lock_device().await?;
+        held.run(async {
+            if let Some(batch) = self.pending_upload().await? {
+                let live = self.live_upload_keys(&batch).await?;
+                let staged = self.store.staged();
+                if !live.is_empty() {
+                    // A fenced write also refuses a superseded holder before any
+                    // public batch is returned, including a recovered one.
+                    staged
+                        .put_aux(Namespace::Device, PENDING, &batch.encode()?)
+                        .await?;
+                    staged.commit().await?;
+                    return Ok(PreKeyUploadBatch {
+                        pre_keys: live,
+                        ..batch
+                    });
+                }
+                staged.delete_aux(Namespace::Device, &[PENDING]).await?;
                 staged.commit().await?;
-                return Ok(PreKeyUploadBatch {
-                    pre_keys: live,
-                    ..batch
-                });
             }
-            staged.delete_aux(Namespace::Device, &[PENDING]).await?;
-            staged.commit().await?;
-        }
-        let mut batch_id = [0; 16];
-        rng().fill_bytes(&mut batch_id);
-        let batch_id = hex::encode(batch_id);
-        let public = self
-            .allocate_prekeys(count, &BTreeSet::new(), Some(&batch_id))
-            .await?;
-        Ok(PreKeyUploadBatch {
-            batch_id,
-            pre_keys: public,
+            let mut batch_id = [0; 16];
+            rng().fill_bytes(&mut batch_id);
+            let batch_id = hex::encode(batch_id);
+            let public = self
+                .allocate_prekeys(count, &BTreeSet::new(), Some(&batch_id))
+                .await?;
+            Ok(PreKeyUploadBatch {
+                batch_id,
+                pre_keys: public,
+            })
         })
+        .await
     }
 
     /// Acknowledge exactly the uploaded IDs. They must be unique members of
@@ -171,60 +174,65 @@ impl<S: ServiceStore> SignalOps<S> {
         batch_id: &str,
         exact_ids: &[u32],
     ) -> Result<(), OpsError> {
-        let _held = self.device_write.lock().await;
-        let invalid = || {
-            OpsError::InvalidInput("prekey upload batch or acknowledgment does not match".into())
-        };
-        let ids: BTreeSet<_> = exact_ids.iter().copied().collect();
-        if ids.is_empty() || ids.len() != exact_ids.len() {
-            return Err(invalid());
-        }
-        if let Some(bytes) = self.store.load_aux(Namespace::Device, LAST_ACK).await? {
-            let acknowledged = PreKeyUploadBatch::decode(&bytes)?;
-            if acknowledged.batch_id == batch_id {
-                if acknowledged
-                    .pre_keys
-                    .iter()
-                    .map(|key| key.id)
-                    .collect::<BTreeSet<_>>()
-                    != ids
-                {
-                    return Err(invalid());
-                }
-                let staged = self.store.staged();
-                staged.put_aux(Namespace::Device, LAST_ACK, &bytes).await?;
-                staged.commit().await?;
-                return Ok(());
+        let held = self.lock_device().await?;
+        held.run(async {
+            let invalid = || {
+                OpsError::InvalidInput(
+                    "prekey upload batch or acknowledgment does not match".into(),
+                )
+            };
+            let ids: BTreeSet<_> = exact_ids.iter().copied().collect();
+            if ids.is_empty() || ids.len() != exact_ids.len() {
+                return Err(invalid());
             }
-        }
-        let batch = self.pending_upload().await?.ok_or_else(invalid)?;
-        if batch.batch_id != batch_id {
-            return Err(invalid());
-        }
-        let members: BTreeSet<_> = batch.pre_keys.iter().map(|key| key.id).collect();
-        let live = self.live_upload_keys(&batch).await?;
-        if ids.len() != exact_ids.len()
-            || !ids.is_subset(&members)
-            || live.iter().any(|key| !ids.contains(&key.id))
-        {
-            return Err(invalid());
-        }
-        let staged = self.store.staged();
-        staged.mark_prekeys_uploaded(exact_ids).await?;
-        let receipt = PreKeyUploadBatch {
-            batch_id: batch.batch_id,
-            pre_keys: batch
-                .pre_keys
-                .into_iter()
-                .filter(|key| ids.contains(&key.id))
-                .collect(),
-        };
-        staged
-            .put_aux(Namespace::Device, LAST_ACK, &receipt.encode()?)
-            .await?;
-        staged.delete_aux(Namespace::Device, &[PENDING]).await?;
-        staged.commit().await?;
-        Ok(())
+            if let Some(bytes) = self.store.load_aux(Namespace::Device, LAST_ACK).await? {
+                let acknowledged = PreKeyUploadBatch::decode(&bytes)?;
+                if acknowledged.batch_id == batch_id {
+                    if acknowledged
+                        .pre_keys
+                        .iter()
+                        .map(|key| key.id)
+                        .collect::<BTreeSet<_>>()
+                        != ids
+                    {
+                        return Err(invalid());
+                    }
+                    let staged = self.store.staged();
+                    staged.put_aux(Namespace::Device, LAST_ACK, &bytes).await?;
+                    staged.commit().await?;
+                    return Ok(());
+                }
+            }
+            let batch = self.pending_upload().await?.ok_or_else(invalid)?;
+            if batch.batch_id != batch_id {
+                return Err(invalid());
+            }
+            let members: BTreeSet<_> = batch.pre_keys.iter().map(|key| key.id).collect();
+            let live = self.live_upload_keys(&batch).await?;
+            if ids.len() != exact_ids.len()
+                || !ids.is_subset(&members)
+                || live.iter().any(|key| !ids.contains(&key.id))
+            {
+                return Err(invalid());
+            }
+            let staged = self.store.staged();
+            staged.mark_prekeys_uploaded(exact_ids).await?;
+            let receipt = PreKeyUploadBatch {
+                batch_id: batch.batch_id,
+                pre_keys: batch
+                    .pre_keys
+                    .into_iter()
+                    .filter(|key| ids.contains(&key.id))
+                    .collect(),
+            };
+            staged
+                .put_aux(Namespace::Device, LAST_ACK, &receipt.encode()?)
+                .await?;
+            staged.delete_aux(Namespace::Device, &[PENDING]).await?;
+            staged.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     pub(super) async fn generate_fresh_prekeys(
@@ -232,29 +240,35 @@ impl<S: ServiceStore> SignalOps<S> {
         count: u32,
     ) -> Result<Vec<PublicPreKey>, OpsError> {
         count_valid(count)?;
-        let _held = self.device_write.lock().await;
-        let reserved = if let Some(batch) = self.pending_upload().await? {
-            self.live_upload_keys(&batch).await?;
-            batch.pre_keys.into_iter().map(|key| key.id).collect()
-        } else {
-            BTreeSet::new()
-        };
-        self.allocate_prekeys(count, &reserved, None).await
+        let held = self.lock_device().await?;
+        held.run(async {
+            let reserved = if let Some(batch) = self.pending_upload().await? {
+                self.live_upload_keys(&batch).await?;
+                batch.pre_keys.into_iter().map(|key| key.id).collect()
+            } else {
+                BTreeSet::new()
+            };
+            self.allocate_prekeys(count, &reserved, None).await
+        })
+        .await
     }
 
     pub(super) async fn mark_fresh_prekeys_uploaded(&self, ids: &[u32]) -> Result<(), OpsError> {
-        let _held = self.device_write.lock().await;
-        if let Some(batch) = self.pending_upload().await? {
-            let reserved: BTreeSet<_> = batch.pre_keys.iter().map(|key| key.id).collect();
-            // Original membership, including consumed keys, remains batch
-            // authority until ACK or retirement. Check before any flag write.
-            if ids.iter().any(|id| reserved.contains(id)) {
-                return Err(OpsError::InvalidInput(
-                    "pending upload members require batch acknowledgment".into(),
-                ));
+        let held = self.lock_device().await?;
+        held.run(async {
+            if let Some(batch) = self.pending_upload().await? {
+                let reserved: BTreeSet<_> = batch.pre_keys.iter().map(|key| key.id).collect();
+                // Original membership, including consumed keys, remains batch
+                // authority until ACK or retirement. Check before any flag write.
+                if ids.iter().any(|id| reserved.contains(id)) {
+                    return Err(OpsError::InvalidInput(
+                        "pending upload members require batch acknowledgment".into(),
+                    ));
+                }
             }
-        }
-        Ok(self.store.mark_prekeys_uploaded(ids).await?)
+            Ok(self.store.mark_prekeys_uploaded(ids).await?)
+        })
+        .await
     }
 
     async fn allocate_prekeys(

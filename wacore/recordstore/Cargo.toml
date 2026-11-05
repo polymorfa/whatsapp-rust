@@ -16,6 +16,7 @@ conformance = []
 
 [dependencies]
 aes-gcm = { workspace = true }
+async-lock = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }

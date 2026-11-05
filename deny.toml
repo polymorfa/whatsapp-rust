@@ -160,8 +160,8 @@ skip = [
     # duplicate. Collapses when Wasmtime and unwasm move up.
     { name = "wasm-encoder", version = "=0.254.2" },
     { name = "wasmparser", version = "=0.254.2" },
-    { name = "zstd", version = "=0.13.3" },
-    { name = "zstd-safe", version = "=7.3.0" },
+    { name = "zstd", version = "=0.13.4" },
+    { name = "zstd-safe", version = "=7.4.0" },
 ]
 
 [sources]

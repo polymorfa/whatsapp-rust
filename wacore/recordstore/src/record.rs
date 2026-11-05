@@ -181,6 +181,8 @@ pub trait RecordStore: Send + Sync {
     /// scope's current lease generation. Otherwise return
     /// [`FenceLost::into_store_error`] and apply nothing. An `Insert` whose key
     /// exists fails the batch with [`RecordExists::into_store_error`].
+    /// An `Insert` followed by a `Delete` of the same key checks absence
+    /// atomically without retaining a record after a successful batch.
     async fn write(&self, fence: &Fence, ops: &[WriteOp]) -> Result<()>;
 }
 

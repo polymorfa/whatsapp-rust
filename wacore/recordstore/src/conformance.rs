@@ -24,6 +24,7 @@ pub async fn run_all<S: RecordStore + LeaseStore>(store: &S) {
     a_batch_applies_every_op(store, &run).await;
     update_never_inserts(store, &run).await;
     insert_is_exclusive_and_atomic(store, &run).await;
+    insert_then_delete_preserves_absence_and_batch_atomicity(store, &run).await;
     scan_orders_filters_and_limits(store, &run).await;
     scopes_and_namespaces_are_isolated(store, &run).await;
     get_many_returns_only_existing_keys(store, &run).await;
@@ -31,6 +32,63 @@ pub async fn run_all<S: RecordStore + LeaseStore>(store: &S) {
 
 fn scope(run: &str, check: &str) -> String {
     format!("conformance-{run}-{check}")
+}
+
+pub async fn insert_then_delete_preserves_absence_and_batch_atomicity<
+    S: RecordStore + LeaseStore,
+>(
+    store: &S,
+    run: &str,
+) {
+    let scope = scope(run, "insert-then-delete");
+    let fence = take(store, &scope, "holder", 1_000).await;
+    let ns = Namespace::PreKey;
+    let conditional_delete = |key: &str| {
+        vec![
+            WriteOp::Insert {
+                ns,
+                key: key.into(),
+                value: b"sealed-placeholder".to_vec(),
+            },
+            WriteOp::Delete {
+                ns,
+                key: key.into(),
+            },
+            put(Namespace::Device, "other", b"whole-batch"),
+        ]
+    };
+    store
+        .write(&fence, &conditional_delete("absent"))
+        .await
+        .unwrap();
+    assert_eq!(store.get(&scope, ns, "absent").await.unwrap(), None);
+    assert_eq!(
+        store.get(&scope, Namespace::Device, "other").await.unwrap(),
+        Some(b"whole-batch".to_vec())
+    );
+    store
+        .write(
+            &fence,
+            &[
+                put(ns, "present", b"independent"),
+                put(Namespace::Device, "other", b"original"),
+            ],
+        )
+        .await
+        .unwrap();
+    let error = store
+        .write(&fence, &conditional_delete("present"))
+        .await
+        .unwrap_err();
+    assert!(is_record_exists(&error));
+    assert_eq!(
+        store.get(&scope, ns, "present").await.unwrap(),
+        Some(b"independent".to_vec())
+    );
+    assert_eq!(
+        store.get(&scope, Namespace::Device, "other").await.unwrap(),
+        Some(b"original".to_vec())
+    );
 }
 
 fn put(ns: Namespace, key: &str, value: &[u8]) -> WriteOp {

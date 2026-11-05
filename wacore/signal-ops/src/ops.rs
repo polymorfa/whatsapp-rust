@@ -177,8 +177,7 @@ pub struct PairingSignature {
     pub key_index: u32,
 }
 
-/// Locks held by one operation.
-pub(crate) type Held = Vec<async_lock::MutexGuardArc<()>>;
+use crate::guard::Held;
 
 /// Lock key for one peer device's session and identity.
 pub(crate) fn session_key(address: &ProtocolAddress) -> String {
@@ -241,7 +240,8 @@ pub struct SignalOps<S> {
     store: Arc<S>,
     keys: RwLock<Arc<DeviceKeys>>,
     /// Held while device keys are read-modify-written.
-    device_write: Mutex<()>,
+    device_write: Arc<Mutex<()>>,
+    usable: Arc<std::sync::atomic::AtomicBool>,
     locks: Arc<KeyedLocks>,
     sender_key_locks: Arc<KeyedLocks>,
 }
@@ -283,7 +283,8 @@ impl<S: ServiceStore> SignalOps<S> {
         Self {
             store,
             keys: RwLock::new(Arc::new(keys)),
-            device_write: Mutex::new(()),
+            device_write: Arc::new(Mutex::new(())),
+            usable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             locks: Arc::new(KeyedLocks::default()),
             sender_key_locks: Arc::new(KeyedLocks::default()),
         }
@@ -305,16 +306,39 @@ impl<S: ServiceStore> SignalOps<S> {
         &self.store
     }
 
-    /// Lock every key, in sorted order. Hold the result for the duration of
-    /// the operation.
-    pub(crate) async fn lock_keys(&self, mut keys: Vec<String>) -> Held {
+    /// Whether this instance can still mutate Signal state. Cancellation of a
+    /// locked operation retires it; release the lease and use a higher fence
+    /// before constructing its replacement.
+    pub fn is_usable(&self) -> bool {
+        self.usable.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn require_usable(&self) -> Result<(), OpsError> {
+        if self.is_usable() {
+            Ok(())
+        } else {
+            Err(crate::error::interrupted_operation())
+        }
+    }
+
+    pub(crate) async fn lock_device(&self) -> Result<Held, OpsError> {
+        self.require_usable()?;
+        let held = self.device_write.lock_arc().await;
+        self.require_usable()?;
+        Ok(Held::new(vec![held], self.usable.clone()))
+    }
+
+    /// Acquire sorted state locks, then check for a cancelled predecessor.
+    pub(crate) async fn lock_keys(&self, mut keys: Vec<String>) -> Result<Held, OpsError> {
+        self.require_usable()?;
         keys.sort();
         keys.dedup();
         let mut held = Vec::with_capacity(keys.len());
         for key in keys {
             held.push(self.locks.get(&key).lock_arc().await);
         }
-        held
+        self.require_usable()?;
+        Ok(Held::new(held, self.usable.clone()))
     }
 
     pub(crate) async fn keys(&self) -> Arc<DeviceKeys> {
@@ -328,11 +352,14 @@ impl<S: ServiceStore> SignalOps<S> {
             jid.parse::<wacore_binary::Jid>()
                 .map_err(|_| OpsError::InvalidInput(format!("{jid} is not a JID")))?;
         }
-        let _guard = self.device_write.lock().await;
-        let mut keys = (**self.keys.read().await).clone();
-        keys.own_pn = Some(pn.to_owned());
-        keys.own_lid = lid.map(str::to_owned);
-        self.replace_keys(keys).await
+        let held = self.lock_device().await?;
+        held.run(async {
+            let mut keys = (**self.keys.read().await).clone();
+            keys.own_pn = Some(pn.to_owned());
+            keys.own_lid = lid.map(str::to_owned);
+            self.replace_keys(keys).await
+        })
+        .await
     }
 
     async fn replace_keys(&self, keys: DeviceKeys) -> Result<(), OpsError> {
@@ -362,31 +389,34 @@ impl<S: ServiceStore> SignalOps<S> {
     /// Replace the signed prekey. The old one stays loadable by ID so prekey
     /// messages minted against it still decrypt.
     pub async fn rotate_signed_prekey(&self) -> Result<PublicSignedPreKey, OpsError> {
-        let _guard = self.device_write.lock().await;
-        let mut keys = (**self.keys.read().await).clone();
-        let retired = record_helpers::new_signed_pre_key_record(
-            keys.signed_prekey_id,
-            &keys.signed_prekey,
-            keys.signed_prekey_signature,
-            wacore::time::now_utc(),
-        );
-        self.store
-            .store_signed_prekey(
+        let held = self.lock_device().await?;
+        held.run(async {
+            let mut keys = (**self.keys.read().await).clone();
+            let retired = record_helpers::new_signed_pre_key_record(
                 keys.signed_prekey_id,
-                &waproto::codec::signed_pre_key_record_to_vec(&retired),
-            )
-            .await?;
-        let pair = KeyPair::generate(&mut rng());
-        keys.signed_prekey_signature = sign_prekey(&keys.identity, &pair)?;
-        keys.signed_prekey = pair;
-        keys.signed_prekey_id = if keys.signed_prekey_id >= MAX_PREKEY_ID {
-            1
-        } else {
-            keys.signed_prekey_id + 1
-        };
-        let public = keys.public().signed_prekey;
-        self.replace_keys(keys).await?;
-        Ok(public)
+                &keys.signed_prekey,
+                keys.signed_prekey_signature,
+                wacore::time::now_utc(),
+            );
+            self.store
+                .store_signed_prekey(
+                    keys.signed_prekey_id,
+                    &waproto::codec::signed_pre_key_record_to_vec(&retired),
+                )
+                .await?;
+            let pair = KeyPair::generate(&mut rng());
+            keys.signed_prekey_signature = sign_prekey(&keys.identity, &pair)?;
+            keys.signed_prekey = pair;
+            keys.signed_prekey_id = if keys.signed_prekey_id >= MAX_PREKEY_ID {
+                1
+            } else {
+                keys.signed_prekey_id + 1
+            };
+            let public = keys.public().signed_prekey;
+            self.replace_keys(keys).await?;
+            Ok(public)
+        })
+        .await
     }
 
     /// Stored session and identity addresses of every device of `user` on
@@ -425,15 +455,18 @@ impl<S: ServiceStore> SignalOps<S> {
         if addresses.is_empty() {
             return Ok(());
         }
-        let _held = self
+        let held = self
             .lock_keys(addresses.iter().map(|a| format!("s:{a}")).collect())
-            .await;
-        let batch: Vec<Arc<str>> = addresses.iter().map(|a| Arc::from(a.as_str())).collect();
-        let staged = self.store.staged();
-        staged.delete_sessions_batch(&batch).await?;
-        staged.delete_identities_batch(&batch).await?;
-        staged.commit().await?;
-        Ok(())
+            .await?;
+        held.run(async {
+            let batch: Vec<Arc<str>> = addresses.iter().map(|a| Arc::from(a.as_str())).collect();
+            let staged = self.store.staged();
+            staged.delete_sessions_batch(&batch).await?;
+            staged.delete_identities_batch(&batch).await?;
+            staged.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Move a user's sessions and identities from phone-number addresses to
@@ -461,34 +494,37 @@ impl<S: ServiceStore> SignalOps<S> {
         if moves.is_empty() {
             return Ok(0);
         }
-        let _held = self
+        let held = self
             .lock_keys(
                 moves
                     .iter()
                     .flat_map(|(from, to)| [format!("s:{from}"), format!("s:{to}")])
                     .collect(),
             )
-            .await;
-        let staged = self.store.staged();
-        let mut moved = 0;
-        for (from, to) in &moves {
-            let mut changed = false;
-            if let Some(session) = staged.get_session(from).await? {
-                staged.put_session(to, &session).await?;
-                staged.delete_session(from).await?;
-                changed = true;
-            }
-            if let Some(identity) = staged.load_identity(from).await? {
-                if staged.load_identity(to).await?.is_none() {
-                    staged.put_identity(to, identity).await?;
+            .await?;
+        held.run(async {
+            let staged = self.store.staged();
+            let mut moved = 0;
+            for (from, to) in &moves {
+                let mut changed = false;
+                if let Some(session) = staged.get_session(from).await? {
+                    staged.put_session(to, &session).await?;
+                    staged.delete_session(from).await?;
+                    changed = true;
                 }
-                staged.delete_identity(from).await?;
-                changed = true;
+                if let Some(identity) = staged.load_identity(from).await? {
+                    if staged.load_identity(to).await?.is_none() {
+                        staged.put_identity(to, identity).await?;
+                    }
+                    staged.delete_identity(from).await?;
+                    changed = true;
+                }
+                moved += usize::from(changed);
             }
-            moved += usize::from(changed);
-        }
-        staged.commit().await?;
-        Ok(moved)
+            staged.commit().await?;
+            Ok(moved)
+        })
+        .await
     }
 
     pub async fn has_session(&self, address: &ProtocolAddress) -> Result<bool, OpsError> {
@@ -502,11 +538,14 @@ impl<S: ServiceStore> SignalOps<S> {
         address: &ProtocolAddress,
         bundle: &RemoteBundle,
     ) -> Result<(), OpsError> {
-        let _held = self.lock_keys(vec![session_key(address)]).await;
-        let staged = Arc::new(self.store.staged());
-        self.establish_into(&staged, address, bundle).await?;
-        staged.commit().await?;
-        Ok(())
+        let held = self.lock_keys(vec![session_key(address)]).await?;
+        held.run(async {
+            let staged = Arc::new(self.store.staged());
+            self.establish_into(&staged, address, bundle).await?;
+            staged.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     /// X3DH into a staged view without committing it. The caller holds the
@@ -540,11 +579,14 @@ impl<S: ServiceStore> SignalOps<S> {
         kind: EncKind,
         ciphertext: &[u8],
     ) -> Result<Decrypted, OpsError> {
-        let _held = self.lock_keys(vec![session_key(sender)]).await;
-        let staged = Arc::new(self.store.staged());
-        let decrypted = self.decrypt_into(&staged, sender, kind, ciphertext).await?;
-        staged.commit().await?;
-        Ok(decrypted)
+        let held = self.lock_keys(vec![session_key(sender)]).await?;
+        held.run(async {
+            let staged = Arc::new(self.store.staged());
+            let decrypted = self.decrypt_into(&staged, sender, kind, ciphertext).await?;
+            staged.commit().await?;
+            Ok(decrypted)
+        })
+        .await
     }
 
     /// Decrypt into a staged view without committing it. The caller holds the
@@ -601,23 +643,27 @@ impl<S: ServiceStore> SignalOps<S> {
         recipient: &ProtocolAddress,
         plaintext: &[u8],
     ) -> Result<Encrypted, OpsError> {
-        let _held = self.lock_keys(vec![session_key(recipient)]).await;
-        let mut sessions = self.stores().await;
-        let mut identities = sessions.clone();
-        let message = message_encrypt(plaintext, recipient, &mut sessions, &mut identities).await?;
-        let kind = match message.message_type() {
-            CiphertextMessageType::PreKey => EncKind::PreKey,
-            CiphertextMessageType::Whisper => EncKind::Message,
-            other => {
-                return Err(OpsError::InvalidInput(format!(
-                    "unexpected pairwise ciphertext type {other:?}"
-                )));
-            }
-        };
-        Ok(Encrypted {
-            kind,
-            ciphertext: message.serialize().to_vec(),
+        let held = self.lock_keys(vec![session_key(recipient)]).await?;
+        held.run(async {
+            let mut sessions = self.stores().await;
+            let mut identities = sessions.clone();
+            let message =
+                message_encrypt(plaintext, recipient, &mut sessions, &mut identities).await?;
+            let kind = match message.message_type() {
+                CiphertextMessageType::PreKey => EncKind::PreKey,
+                CiphertextMessageType::Whisper => EncKind::Message,
+                other => {
+                    return Err(OpsError::InvalidInput(format!(
+                        "unexpected pairwise ciphertext type {other:?}"
+                    )));
+                }
+            };
+            Ok(Encrypted {
+                kind,
+                ciphertext: message.serialize().to_vec(),
+            })
         })
+        .await
     }
 
     /// The sender-key distribution message for our own chain in `group`,
@@ -628,12 +674,16 @@ impl<S: ServiceStore> SignalOps<S> {
         own_address: &ProtocolAddress,
     ) -> Result<Vec<u8>, OpsError> {
         let name = SenderKeyName::from_parts(group, own_address.as_str());
-        let _held = self
+        let held = self
             .lock_keys(vec![chain_key(group, own_address.as_str())])
-            .await;
-        let mut store = self.stores().await;
-        let skdm = create_sender_key_distribution_message(&name, &mut store, &mut rng()).await?;
-        Ok(skdm.serialized().to_vec())
+            .await?;
+        held.run(async {
+            let mut store = self.stores().await;
+            let skdm =
+                create_sender_key_distribution_message(&name, &mut store, &mut rng()).await?;
+            Ok(skdm.serialized().to_vec())
+        })
+        .await
     }
 
     /// Encrypt group plaintext (`skmsg`) on our own chain.
@@ -644,12 +694,15 @@ impl<S: ServiceStore> SignalOps<S> {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, OpsError> {
         let name = SenderKeyName::from_parts(group, own_address.as_str());
-        let _held = self
+        let held = self
             .lock_keys(vec![chain_key(group, own_address.as_str())])
-            .await;
-        let mut store = self.stores().await;
-        let message = group_encrypt(&mut store, &name, plaintext, &mut rng()).await?;
-        Ok(message.serialized().to_vec())
+            .await?;
+        held.run(async {
+            let mut store = self.stores().await;
+            let message = group_encrypt(&mut store, &name, plaintext, &mut rng()).await?;
+            Ok(message.serialized().to_vec())
+        })
+        .await
     }
 
     /// Store a member's sender key received in a decrypted message.
@@ -661,12 +714,15 @@ impl<S: ServiceStore> SignalOps<S> {
     ) -> Result<(), OpsError> {
         let name = SenderKeyName::from_parts(group, sender.as_str());
         let message = SenderKeyDistributionMessage::try_from(skdm)?;
-        let _held = self
+        let held = self
             .lock_keys(vec![chain_key(group, sender.as_str())])
-            .await;
-        let mut store = self.stores().await;
-        process_sender_key_distribution_message(&name, &message, &mut store).await?;
-        Ok(())
+            .await?;
+        held.run(async {
+            let mut store = self.stores().await;
+            process_sender_key_distribution_message(&name, &message, &mut store).await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Decrypt a group `skmsg` into a staged view without committing it.
@@ -705,11 +761,14 @@ impl<S: ServiceStore> SignalOps<S> {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, OpsError> {
         let name = SenderKeyName::from_parts(group, sender.as_str());
-        let _held = self
+        let held = self
             .lock_keys(vec![chain_key(group, sender.as_str())])
-            .await;
-        let mut store = self.stores().await;
-        Ok(group_decrypt(ciphertext, &mut store, &name).await?)
+            .await?;
+        held.run(async {
+            let mut store = self.stores().await;
+            Ok(group_decrypt(ciphertext, &mut store, &name).await?)
+        })
+        .await
     }
 
     /// Verify the primary's pair-success container and add our device
@@ -730,13 +789,16 @@ impl<S: ServiceStore> SignalOps<S> {
             text: e.text,
         })?;
         // Kept for prekey messages, which carry the device identity.
-        let _guard = self.device_write.lock().await;
-        let mut updated = (**self.keys.read().await).clone();
-        updated.account = Some(signed_identity.clone());
-        self.replace_keys(updated).await?;
-        Ok(PairingSignature {
-            signed_identity,
-            key_index,
+        let held = self.lock_device().await?;
+        held.run(async {
+            let mut updated = (**self.keys.read().await).clone();
+            updated.account = Some(signed_identity.clone());
+            self.replace_keys(updated).await?;
+            Ok(PairingSignature {
+                signed_identity,
+                key_index,
+            })
         })
+        .await
     }
 }

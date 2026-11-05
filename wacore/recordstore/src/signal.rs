@@ -1,9 +1,10 @@
 use crate::record::{Fence, Namespace, RecordExists, RecordStore, WriteOp};
 use crate::seal::{SealError, Sealer};
+use async_lock::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use wacore::store::error::{Result, StoreError};
 use wacore::store::traits::SignalStore;
 
@@ -38,6 +39,8 @@ enum Staged {
     Put(Vec<u8>),
     /// Applied only if the key is still absent when the batch commits.
     Insert(Vec<u8>),
+    /// No final value, while preserving an earlier insert's absence check.
+    InsertDeleted,
     /// Applied only if the key still exists when the batch commits.
     Update(Vec<u8>),
     Delete,
@@ -114,37 +117,55 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
     }
 
     /// Seal and apply every pending write of a staged view in one fenced
-    /// batch. Committing a view that is not staged is a no-op.
+    /// batch. Pending writes remain available after an error or cancellation.
+    /// Committing a view that is not staged is a no-op.
     pub async fn commit(&self) -> Result<()> {
-        let pending = match &self.overlay {
-            Some(overlay) => std::mem::take(&mut *lock(overlay)?),
+        let mut pending = match &self.overlay {
+            Some(overlay) => overlay.lock().await,
             None => return Ok(()),
         };
         let mut ops = Vec::with_capacity(pending.len());
-        for ((ns, key), change) in pending {
-            ops.push(match change {
+        // Keep the async guard until the durable write succeeds. Concurrent
+        // edits cannot disappear behind a successful commit or a failed retry.
+        for ((ns, key), change) in pending.iter() {
+            let ns = *ns;
+            let key = key.clone();
+            let op = match change {
                 Staged::Put(plaintext) => WriteOp::Put {
-                    value: self.seal(ns, &key, &plaintext).await?,
+                    value: self.seal(ns, &key, plaintext).await?,
                     ns,
                     key,
                 },
                 Staged::Insert(plaintext) => WriteOp::Insert {
-                    value: self.seal(ns, &key, &plaintext).await?,
+                    value: self.seal(ns, &key, plaintext).await?,
                     ns,
                     key,
                 },
+                Staged::InsertDeleted => {
+                    // The batch must still prove the slot was absent, even
+                    // though this view's final state has no record there.
+                    ops.push(WriteOp::Insert {
+                        value: self.seal(ns, &key, &[]).await?,
+                        ns,
+                        key: key.clone(),
+                    });
+                    WriteOp::Delete { ns, key }
+                }
                 Staged::Update(plaintext) => WriteOp::Update {
-                    value: self.seal(ns, &key, &plaintext).await?,
+                    value: self.seal(ns, &key, plaintext).await?,
                     ns,
                     key,
                 },
                 Staged::Delete => WriteOp::Delete { ns, key },
-            });
+            };
+            ops.push(op);
         }
         if ops.is_empty() {
             return Ok(());
         }
-        self.records.write(&self.fence, &ops).await
+        self.records.write(&self.fence, &ops).await?;
+        pending.clear();
+        Ok(())
     }
 
     fn scope(&self) -> &str {
@@ -184,17 +205,17 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
     }
 
     /// The staged change for one key, if this view holds one.
-    fn pending(&self, ns: Namespace, key: &str) -> Result<Option<Staged>> {
+    async fn pending(&self, ns: Namespace, key: &str) -> Option<Staged> {
         match &self.overlay {
-            Some(overlay) => Ok(lock(overlay)?.get(&(ns, key.to_owned())).cloned()),
-            None => Ok(None),
+            Some(overlay) => overlay.lock().await.get(&(ns, key.to_owned())).cloned(),
+            None => None,
         }
     }
 
     async fn load(&self, ns: Namespace, key: &str) -> Result<Option<Vec<u8>>> {
-        match self.pending(ns, key)? {
+        match self.pending(ns, key).await {
             Some(Staged::Put(v) | Staged::Update(v) | Staged::Insert(v)) => return Ok(Some(v)),
-            Some(Staged::Delete) => return Ok(None),
+            Some(Staged::Delete | Staged::InsertDeleted) => return Ok(None),
             None => {}
         }
         match self.records.get(self.scope(), ns, key).await? {
@@ -207,11 +228,11 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
         let mut opened = Vec::with_capacity(keys.len());
         let mut from_store = Vec::with_capacity(keys.len());
         for key in keys {
-            match self.pending(ns, key)? {
+            match self.pending(ns, key).await {
                 Some(Staged::Put(v) | Staged::Update(v) | Staged::Insert(v)) => {
                     opened.push(((*key).to_owned(), v))
                 }
-                Some(Staged::Delete) => {}
+                Some(Staged::Delete | Staged::InsertDeleted) => {}
                 None => from_store.push(*key),
             }
         }
@@ -230,6 +251,7 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
                 .scan_keys(self.scope(), ns, prefix, limit)
                 .await;
         };
+        let overlay = overlay.lock().await;
         // Pending deletes can hide stored keys, so scan without the limit.
         let mut keys: std::collections::BTreeSet<String> = self
             .records
@@ -237,7 +259,7 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
             .await?
             .into_iter()
             .collect();
-        for ((pns, key), change) in lock(overlay)?.iter() {
+        for ((pns, key), change) in overlay.iter() {
             if *pns != ns || !key.starts_with(prefix) {
                 continue;
             }
@@ -245,7 +267,7 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
                 Staged::Put(_) | Staged::Insert(_) => {
                     keys.insert(key.clone());
                 }
-                Staged::Delete => {
+                Staged::Delete | Staged::InsertDeleted => {
                     keys.remove(key);
                 }
                 Staged::Update(_) => {}
@@ -263,7 +285,7 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
             return Ok(());
         }
         if let Some(overlay) = &self.overlay {
-            let mut overlay = lock(overlay)?;
+            let mut overlay = overlay.lock().await;
             // Validate the entire call before changing the view. A second
             // exclusive insert must not replace an earlier staged private key.
             {
@@ -271,9 +293,9 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
                 for op in &ops {
                     if let PlainOp::Insert(ns, key, _) = op
                         && (!inserts.insert((*ns, key))
-                            || overlay
-                                .get(&(*ns, key.clone()))
-                                .is_some_and(|change| !matches!(change, Staged::Delete)))
+                            || overlay.get(&(*ns, key.clone())).is_some_and(|change| {
+                                !matches!(change, Staged::Delete | Staged::InsertDeleted)
+                            }))
                     {
                         return Err(RecordExists {
                             ns: *ns,
@@ -289,7 +311,7 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
                         // A later write may replace the staged value, but it
                         // must retain the original absence check at commit.
                         let change = match overlay.get(&(ns, key.clone())) {
-                            Some(Staged::Insert(_)) => Staged::Insert(v),
+                            Some(Staged::Insert(_) | Staged::InsertDeleted) => Staged::Insert(v),
                             _ => Staged::Put(v),
                         };
                         ((ns, key), change)
@@ -300,12 +322,20 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
                         let staged = match overlay.get(&(ns, key.clone())) {
                             Some(Staged::Put(_)) => Staged::Put(v),
                             Some(Staged::Insert(_)) => Staged::Insert(v),
-                            Some(Staged::Delete) => continue,
+                            Some(Staged::Delete | Staged::InsertDeleted) => continue,
                             _ => Staged::Update(v),
                         };
                         ((ns, key), staged)
                     }
-                    PlainOp::Delete(ns, key) => ((ns, key), Staged::Delete),
+                    PlainOp::Delete(ns, key) => {
+                        let change = match overlay.get(&(ns, key.clone())) {
+                            Some(Staged::Insert(_) | Staged::InsertDeleted) => {
+                                Staged::InsertDeleted
+                            }
+                            _ => Staged::Delete,
+                        };
+                        ((ns, key), change)
+                    }
                 };
                 overlay.insert(slot, change);
             }
@@ -470,12 +500,6 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
     }
 }
 
-fn lock(overlay: &Mutex<Overlay>) -> Result<MutexGuard<'_, Overlay>> {
-    overlay
-        .lock()
-        .map_err(|_| StoreError::Validation("staged record view lock poisoned".into()))
-}
-
 fn seal_error(error: SealError) -> StoreError {
     StoreError::Serialization(Box::new(error))
 }
@@ -596,8 +620,8 @@ impl<R: RecordStore, S: Sealer> SignalStore for RecordSignalStore<R, S> {
     }
 
     async fn has_session(&self, address: &str) -> Result<bool> {
-        match self.pending(Namespace::Session, address)? {
-            Some(Staged::Delete) => Ok(false),
+        match self.pending(Namespace::Session, address).await {
+            Some(Staged::Delete | Staged::InsertDeleted) => Ok(false),
             Some(_) => Ok(true),
             None => Ok(self
                 .records
@@ -820,9 +844,121 @@ mod tests {
         block_on(store.store_prekey(7, b"independent", false)).unwrap();
         let error = block_on(staged.commit()).unwrap_err();
         assert!(crate::is_record_exists(&error));
+        let retry = block_on(staged.commit()).unwrap_err();
+        assert!(crate::is_record_exists(&retry));
+        assert_eq!(
+            block_on(staged.load_prekey(7)).unwrap(),
+            Some(Bytes::from_static(b"updated"))
+        );
         assert_eq!(
             block_on(store.load_prekey(7)).unwrap(),
             Some(Bytes::from_static(b"independent"))
+        );
+    }
+
+    #[test]
+    fn staged_deletes_and_later_writes_keep_the_original_insert_condition() {
+        for put_after_delete in [false, true] {
+            let (_, store) = setup();
+            let staged = store.staged();
+            block_on(staged.insert_prekeys_batch(&[(7, Bytes::from_static(b"first"))])).unwrap();
+            block_on(staged.remove_prekey(7)).unwrap();
+            assert_eq!(block_on(staged.load_prekey(7)).unwrap(), None);
+            if put_after_delete {
+                block_on(staged.store_prekey(7, b"later", false)).unwrap();
+            }
+            block_on(staged.put_aux(Namespace::DecryptBuffer, "unrelated", b"must-not-commit"))
+                .unwrap();
+            block_on(store.store_prekey(7, b"independent", false)).unwrap();
+            for _ in 0..2 {
+                let error = block_on(staged.commit()).unwrap_err();
+                assert!(crate::is_record_exists(&error));
+                assert_eq!(
+                    block_on(store.load_prekey(7)).unwrap(),
+                    Some(Bytes::from_static(b"independent"))
+                );
+                assert_eq!(
+                    block_on(store.load_aux(Namespace::DecryptBuffer, "unrelated")).unwrap(),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inserting_then_deleting_an_absent_key_commits_without_leaving_a_record() {
+        let (_, store) = setup();
+        let staged = store.staged();
+        block_on(staged.insert_prekeys_batch(&[(7, Bytes::from_static(b"first"))])).unwrap();
+        block_on(staged.remove_prekey(7)).unwrap();
+        block_on(staged.put_aux(Namespace::DecryptBuffer, "other", b"committed")).unwrap();
+        block_on(staged.commit()).unwrap();
+        assert_eq!(block_on(store.load_prekey(7)).unwrap(), None);
+        assert_eq!(
+            block_on(store.load_aux(Namespace::DecryptBuffer, "other")).unwrap(),
+            Some(b"committed".to_vec())
+        );
+    }
+
+    struct PausedSealer {
+        paused: std::sync::atomic::AtomicBool,
+        inner: AesGcmSealer,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl Sealer for PausedSealer {
+        async fn seal(
+            &self,
+            aad: &[u8],
+            plaintext: &[u8],
+        ) -> std::result::Result<Vec<u8>, SealError> {
+            if self.paused.load(std::sync::atomic::Ordering::SeqCst) {
+                futures::future::pending::<()>().await;
+            }
+            self.inner.seal(aad, plaintext).await
+        }
+
+        async fn open(&self, aad: &[u8], sealed: &[u8]) -> std::result::Result<Vec<u8>, SealError> {
+            self.inner.open(aad, sealed).await
+        }
+    }
+
+    #[test]
+    fn cancelling_a_commit_before_submission_keeps_its_pending_writes() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let records = Arc::new(MemoryRecordStore::new());
+        let lease = block_on(records.acquire("cancelled", "node", 0, TTL))
+            .unwrap()
+            .unwrap();
+        let sealer = Arc::new(PausedSealer {
+            paused: std::sync::atomic::AtomicBool::new(true),
+            inner: AesGcmSealer::new(&[3; 32]),
+        });
+        let store = RecordSignalStore::new(records, sealer.clone(), lease.fence);
+        let staged = store.staged();
+        block_on(staged.save_device(b"pending-private-state")).unwrap();
+        let mut commit = Box::pin(staged.commit());
+        assert!(matches!(
+            commit
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        drop(commit);
+        assert_eq!(
+            block_on(staged.load_device()).unwrap(),
+            Some(b"pending-private-state".to_vec())
+        );
+        assert_eq!(block_on(store.load_device()).unwrap(), None);
+        sealer
+            .paused
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        block_on(staged.commit()).unwrap();
+        assert_eq!(
+            block_on(store.load_device()).unwrap(),
+            Some(b"pending-private-state".to_vec())
         );
     }
 

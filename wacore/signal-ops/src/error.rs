@@ -2,6 +2,19 @@ use wacore::libsignal::protocol::SignalProtocolError;
 use wacore::store::error::StoreError;
 
 #[derive(Debug, thiserror::Error)]
+#[error("a Signal operation was interrupted; acquire a new fenced instance")]
+struct InterruptedOperation;
+
+pub(crate) fn interrupted_operation() -> OpsError {
+    StoreError::Database(Box::new(InterruptedOperation)).into()
+}
+
+fn state_is_refused(error: &StoreError) -> bool {
+    wacore_recordstore::is_fence_lost(error)
+        || matches!(error, StoreError::Database(source) if source.is::<InterruptedOperation>())
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum OpsError {
     #[error("signal protocol error")]
     Signal(#[from] SignalProtocolError),
@@ -24,14 +37,15 @@ pub enum OpsError {
 }
 
 impl OpsError {
-    /// The store refused a write because another node now holds the scope.
-    /// The caller must stop serving it.
+    /// The state must no longer be served: its lease moved, or cancellation
+    /// left a write with uncertain completion. Release the lease and open a
+    /// new instance at a higher fence before resuming operations.
     pub fn is_fence_lost(&self) -> bool {
         match self {
-            OpsError::Store(e) => wacore_recordstore::is_fence_lost(e),
+            OpsError::Store(e) => state_is_refused(e),
             OpsError::Signal(SignalProtocolError::BackendError(_, source)) => source
                 .downcast_ref::<StoreError>()
-                .is_some_and(wacore_recordstore::is_fence_lost),
+                .is_some_and(state_is_refused),
             _ => false,
         }
     }

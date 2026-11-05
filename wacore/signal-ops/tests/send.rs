@@ -127,6 +127,110 @@ async fn bundle_for(ops: &SignalOps<Store>) -> PreKeyBundle {
     .unwrap()
 }
 
+struct ChangingGroupClient {
+    current: std::sync::RwLock<FakeClient>,
+    pause_devices: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    change_mapping: bool,
+    mapping_reads: std::sync::atomic::AtomicUsize,
+}
+
+impl ChangingGroupClient {
+    fn new(client: FakeClient, change_mapping: bool) -> Self {
+        Self {
+            current: std::sync::RwLock::new(client),
+            pause_devices: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+            change_mapping,
+            mapping_reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SendContextResolver for ChangingGroupClient {
+    async fn resolve_devices(&self, _jids: &[Jid]) -> anyhow::Result<Vec<Jid>> {
+        let snapshot = self.current.read().unwrap().devices.clone();
+        if self
+            .pause_devices
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(snapshot)
+    }
+
+    async fn fetch_prekeys(&self, jids: &[Jid]) -> anyhow::Result<HashMap<Jid, PreKeyBundle>> {
+        let client = self.current.read().unwrap();
+        Ok(jids
+            .iter()
+            .filter_map(|jid| {
+                client
+                    .bundles
+                    .get(jid)
+                    .map(|bundle| (jid.clone(), bundle.clone()))
+            })
+            .collect())
+    }
+
+    async fn fetch_prekeys_for_identity_check(
+        &self,
+        jids: &[Jid],
+    ) -> anyhow::Result<PreKeyFetchOutcome> {
+        Ok(PreKeyFetchOutcome {
+            bundles: self.fetch_prekeys(jids).await?,
+            rejected: Vec::new(),
+        })
+    }
+
+    async fn resolve_group_routing_info(
+        &self,
+        _jid: &Jid,
+    ) -> anyhow::Result<Arc<GroupRoutingInfo>> {
+        Ok(self
+            .current
+            .read()
+            .unwrap()
+            .group
+            .clone()
+            .expect("group fixture"))
+    }
+
+    async fn get_lid_for_phone(&self, user: &str) -> Option<wacore_binary::CompactString> {
+        if self.change_mapping && user == "222" {
+            let previous = self
+                .mapping_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return (previous > 0).then(|| "900222".into());
+        }
+        None
+    }
+}
+
+async fn receive_group_component(
+    ops: &SignalOps<Store>,
+    group: &Jid,
+    from: &Jid,
+    (kind, version, ciphertext): (String, u8, Vec<u8>),
+) -> Result<Received, wacore_signal_ops::OpsError> {
+    ops.receive(ReceiveRequest {
+        chat: &group.to_string(),
+        sender: &from.to_protocol_address(),
+        kind: match kind.as_str() {
+            "pkmsg" => ReceiveKind::PreKey,
+            "msg" => ReceiveKind::Message,
+            _ => ReceiveKind::SenderKey,
+        },
+        ciphertext: &ciphertext,
+        padding_version: version,
+        is_from_me: false,
+    })
+    .await
+}
+
 fn parse(stanza: &[u8]) -> wacore_binary::Node {
     wacore_binary::marshal::unmarshal_packed_ref(stanza)
         .unwrap()
@@ -405,6 +509,204 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
         receive("skmsg", version, ciphertext).await,
         Received::Message(_)
     ));
+}
+
+#[tokio::test]
+async fn a_send_waiting_on_devices_cannot_give_a_removed_member_the_replacement_chain() {
+    use std::task::Poll;
+    use wacore::types::message::AddressingMode;
+    let group: Jid = "12345@g.us".parse().unwrap();
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    let bob_jid: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let carol_jid: Jid = "333@s.whatsapp.net".parse().unwrap();
+    let alice = Arc::new(
+        device_with_lid(
+            "alice-removal-race",
+            &alice_jid.to_string(),
+            Some("900111:1@lid"),
+        )
+        .await,
+    );
+    let bob = device("bob-removal-race", &bob_jid.to_string()).await;
+    let carol = device("carol-removal-race", &carol_jid.to_string()).await;
+    let client = Arc::new(ChangingGroupClient::new(
+        FakeClient {
+            devices: vec![alice_jid.clone(), bob_jid.clone(), carol_jid.clone()],
+            bundles: HashMap::from([
+                (bob_jid.clone(), bundle_for(&bob).await),
+                (carol_jid.clone(), bundle_for(&carol).await),
+            ]),
+            group: Some(Arc::new(GroupRoutingInfo::new(
+                vec![alice_jid.to_non_ad(), bob_jid.clone(), carol_jid.clone()],
+                AddressingMode::Pn,
+            ))),
+        },
+        false,
+    ));
+    let first = alice
+        .send_group(
+            &TokioRuntime,
+            client.as_ref(),
+            &group,
+            &text("before removal"),
+            "BEFORE",
+        )
+        .await
+        .unwrap();
+    receive_group_component(&bob, &group, &alice_jid, enc_for(&first.stanza, &bob_jid))
+        .await
+        .unwrap();
+    receive_group_component(&bob, &group, &alice_jid, skmsg_of(&first.stanza))
+        .await
+        .unwrap();
+    alice
+        .mark_sender_key_distributed(&group, &first.distribution_targets)
+        .await
+        .unwrap();
+    client
+        .pause_devices
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let in_flight = {
+        let alice = alice.clone();
+        let client = client.clone();
+        let group = group.clone();
+        tokio::spawn(async move {
+            alice
+                .send_group(
+                    &TokioRuntime,
+                    client.as_ref(),
+                    &group,
+                    &text("in flight"),
+                    "INFLIGHT",
+                )
+                .await
+                .unwrap()
+        })
+    };
+    client.entered.notified().await;
+    let mut rotation = Box::pin(alice.forget_sender_key_devices(&group));
+    // Poll the rotation while the old device snapshot is suspended. A correct
+    // send finishes on its old chain before rotation can invalidate it.
+    let rotation_progress =
+        futures::future::poll_fn(|cx| Poll::Ready(rotation.as_mut().poll(cx))).await;
+    {
+        let mut current = client.current.write().unwrap();
+        current.devices = vec![alice_jid.clone(), carol_jid.clone()];
+        current.group = Some(Arc::new(GroupRoutingInfo::new(
+            vec![alice_jid.to_non_ad(), carol_jid.clone()],
+            AddressingMode::Pn,
+        )));
+    }
+    client.resume.notify_one();
+    let sent = in_flight.await.unwrap();
+    match rotation_progress {
+        Poll::Ready(result) => result.unwrap(),
+        Poll::Pending => rotation.await.unwrap(),
+    }
+    if let Some(carrier) = pairwise_enc_for(&sent.stanza, &bob_jid) {
+        receive_group_component(&bob, &group, &alice_jid, carrier)
+            .await
+            .unwrap();
+    }
+    receive_group_component(&bob, &group, &alice_jid, skmsg_of(&sent.stanza))
+        .await
+        .unwrap();
+    let after = alice
+        .send_group(
+            &TokioRuntime,
+            client.as_ref(),
+            &group,
+            &text("after removal"),
+            "AFTER",
+        )
+        .await
+        .unwrap();
+    assert!(pairwise_enc_for(&after.stanza, &bob_jid).is_none());
+    assert!(
+        receive_group_component(&bob, &group, &alice_jid, skmsg_of(&after.stanza))
+            .await
+            .is_err(),
+        "a removed participant received the replacement sender key from a stale resolution"
+    );
+    receive_group_component(
+        &carol,
+        &group,
+        &alice_jid,
+        enc_for(&after.stanza, &carol_jid),
+    )
+    .await
+    .unwrap();
+    let Received::Message(message) =
+        receive_group_component(&carol, &group, &alice_jid, skmsg_of(&after.stanza))
+            .await
+            .unwrap()
+    else {
+        panic!("retained participant did not receive the message")
+    };
+    assert_eq!(
+        message.content.message.conversation.as_deref(),
+        Some("after removal")
+    );
+}
+
+#[tokio::test]
+async fn group_encryption_keeps_the_address_selected_before_session_locking() {
+    use wacore::types::message::AddressingMode;
+    let group: Jid = "12345@g.us".parse().unwrap();
+    let alice_jid: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    let bob_jid: Jid = "222@s.whatsapp.net".parse().unwrap();
+    let alice = device_with_lid(
+        "alice-mapping-race",
+        &alice_jid.to_string(),
+        Some("900111:1@lid"),
+    )
+    .await;
+    let bob = device("bob-mapping-race", &bob_jid.to_string()).await;
+    let client = ChangingGroupClient::new(
+        FakeClient {
+            devices: vec![alice_jid.clone(), bob_jid.clone()],
+            bundles: HashMap::from([(bob_jid.clone(), bundle_for(&bob).await)]),
+            group: Some(Arc::new(GroupRoutingInfo::new(
+                vec![alice_jid.to_non_ad(), bob_jid.clone()],
+                AddressingMode::Pn,
+            ))),
+        },
+        true,
+    );
+    let sent = alice
+        .send_group(
+            &TokioRuntime,
+            &client,
+            &group,
+            &text("frozen address"),
+            "FROZEN",
+        )
+        .await
+        .unwrap();
+    // A second lookup would change the encryption address to a LID that has
+    // no fetched bundle and was never included in the acquired lock set.
+    let carrier = pairwise_enc_for(&sent.stanza, &bob_jid)
+        .expect("the frozen PN session must deliver the sender key");
+    receive_group_component(&bob, &group, &alice_jid, carrier)
+        .await
+        .unwrap();
+    let Received::Message(received) =
+        receive_group_component(&bob, &group, &alice_jid, skmsg_of(&sent.stanza))
+            .await
+            .unwrap()
+    else {
+        panic!("expected the group payload")
+    };
+    assert_eq!(
+        received.content.message.conversation.as_deref(),
+        Some("frozen address")
+    );
+    assert_eq!(
+        client
+            .mapping_reads
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 }
 
 /// The first `<enc>` anywhere in the stanza.
