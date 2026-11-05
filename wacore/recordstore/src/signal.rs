@@ -1,4 +1,4 @@
-use crate::record::{Fence, Namespace, RecordStore, WriteOp};
+use crate::record::{Fence, Namespace, RecordExists, RecordStore, WriteOp};
 use crate::seal::{SealError, Sealer};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -264,9 +264,36 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
         }
         if let Some(overlay) = &self.overlay {
             let mut overlay = lock(overlay)?;
+            // Validate the entire call before changing the view. A second
+            // exclusive insert must not replace an earlier staged private key.
+            {
+                let mut inserts = std::collections::BTreeSet::new();
+                for op in &ops {
+                    if let PlainOp::Insert(ns, key, _) = op
+                        && (!inserts.insert((*ns, key))
+                            || overlay
+                                .get(&(*ns, key.clone()))
+                                .is_some_and(|change| !matches!(change, Staged::Delete)))
+                    {
+                        return Err(RecordExists {
+                            ns: *ns,
+                            key: key.clone(),
+                        }
+                        .into_store_error());
+                    }
+                }
+            }
             for op in ops {
                 let (slot, change) = match op {
-                    PlainOp::Put(ns, key, v) => ((ns, key), Staged::Put(v)),
+                    PlainOp::Put(ns, key, v) => {
+                        // A later write may replace the staged value, but it
+                        // must retain the original absence check at commit.
+                        let change = match overlay.get(&(ns, key.clone())) {
+                            Some(Staged::Insert(_)) => Staged::Insert(v),
+                            _ => Staged::Put(v),
+                        };
+                        ((ns, key), change)
+                    }
                     PlainOp::Insert(ns, key, v) => ((ns, key), Staged::Insert(v)),
                     PlainOp::Update(ns, key, v) => {
                         // Updating a key this view already wrote keeps it a Put.
@@ -758,6 +785,45 @@ mod tests {
         ));
         assert_eq!(block_on(store.load_prekey(7)).unwrap(), None);
         assert_eq!(block_on(store.load_prekey(8)).unwrap(), None);
+    }
+
+    #[test]
+    fn repeated_staged_prekey_insert_refuses_the_whole_later_batch() {
+        let (_, store) = setup();
+        let staged = store.staged();
+        block_on(staged.insert_prekeys_batch(&[(7, Bytes::from_static(b"first"))])).unwrap();
+        let error = block_on(staged.insert_prekeys_batch(&[
+            (8, Bytes::from_static(b"must-not-stage")),
+            (7, Bytes::from_static(b"replacement")),
+        ]))
+        .unwrap_err();
+        assert!(crate::is_record_exists(&error));
+        assert_eq!(
+            block_on(staged.load_prekey(7)).unwrap(),
+            Some(Bytes::from_static(b"first"))
+        );
+        assert_eq!(block_on(staged.load_prekey(8)).unwrap(), None);
+        block_on(staged.commit()).unwrap();
+        assert_eq!(
+            block_on(store.load_prekey(7)).unwrap(),
+            Some(Bytes::from_static(b"first"))
+        );
+        assert_eq!(block_on(store.load_prekey(8)).unwrap(), None);
+    }
+
+    #[test]
+    fn a_later_staged_put_preserves_the_exclusive_insert_condition() {
+        let (_, store) = setup();
+        let staged = store.staged();
+        block_on(staged.insert_prekeys_batch(&[(7, Bytes::from_static(b"first"))])).unwrap();
+        block_on(staged.store_prekey(7, b"updated", false)).unwrap();
+        block_on(store.store_prekey(7, b"independent", false)).unwrap();
+        let error = block_on(staged.commit()).unwrap_err();
+        assert!(crate::is_record_exists(&error));
+        assert_eq!(
+            block_on(store.load_prekey(7)).unwrap(),
+            Some(Bytes::from_static(b"independent"))
+        );
     }
 
     #[test]

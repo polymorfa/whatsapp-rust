@@ -61,8 +61,14 @@ fn encode_sent(message: &[u8], secret: Option<&[u8; 32]>) -> Vec<u8> {
     out
 }
 
-/// `(inserted ms, generated secret, message bytes)` of a sent-message record.
-fn decode_sent(record: &[u8]) -> Result<(u64, Option<&[u8]>, &[u8]), OpsError> {
+/// Borrowed fields of a persisted sent-message record.
+struct SentRecord<'a> {
+    inserted_ms: u64,
+    secret: Option<&'a [u8]>,
+    body: &'a [u8],
+}
+
+fn decode_sent(record: &[u8]) -> Result<SentRecord<'_>, OpsError> {
     let corrupt = || OpsError::InvalidInput("sent-message record is corrupt".into());
     let (inserted, rest) = record.split_at_checked(8).ok_or_else(corrupt)?;
     let inserted_ms = u64::from_be_bytes(inserted.try_into().map_err(|_| corrupt())?);
@@ -71,7 +77,11 @@ fn decode_sent(record: &[u8]) -> Result<(u64, Option<&[u8]>, &[u8]), OpsError> {
         Some(1) if rest.len() >= 33 => (Some(&rest[1..33]), &rest[33..]),
         _ => return Err(corrupt()),
     };
-    Ok((inserted_ms, secret, body))
+    Ok(SentRecord {
+        inserted_ms,
+        secret,
+        body,
+    })
 }
 
 fn dm_lock_jids(devices: &[Jid], preferred: &[Jid]) -> Vec<Jid> {
@@ -287,10 +297,10 @@ impl<S: ServiceStore> SignalOps<S> {
         else {
             return Ok(None);
         };
-        let (_, secret, body) = decode_sent(&record)?;
-        let mut message = waproto::codec::message_decode(body)
+        let record = decode_sent(&record)?;
+        let mut message = waproto::codec::message_decode(record.body)
             .map_err(|e| OpsError::InvalidInput(format!("sent message did not decode: {e}")))?;
-        if let Some(secret) = secret {
+        if let Some(secret) = record.secret {
             let mut context = message
                 .message_context_info
                 .as_option()
@@ -639,7 +649,7 @@ impl<S: ServiceStore> SignalOps<S> {
             // A record that no longer decodes cannot serve a resend; delete it
             // rather than let one corrupt entry stop every later prune.
             if let Some(record) = store.load_aux(Namespace::SentMessage, &key).await?
-                && decode_sent(&record).map_or(true, |(sent_ms, _, _)| sent_ms < cutoff_ms)
+                && decode_sent(&record).map_or(true, |record| record.inserted_ms < cutoff_ms)
             {
                 expired.push(key);
             }
@@ -659,9 +669,12 @@ mod tests {
         let pn: Jid = "222:1@s.whatsapp.net".parse().unwrap();
         let lid: Jid = "900222:1@lid".parse().unwrap();
         assert_eq!(
-            dm_lock_jids(&[pn.clone()], &[lid.clone()]),
+            dm_lock_jids(std::slice::from_ref(&pn), std::slice::from_ref(&lid)),
             vec![pn.clone(), lid]
         );
-        assert_eq!(dm_lock_jids(&[pn.clone()], &[pn.clone()]), vec![pn]);
+        assert_eq!(
+            dm_lock_jids(std::slice::from_ref(&pn), std::slice::from_ref(&pn)),
+            vec![pn]
+        );
     }
 }
