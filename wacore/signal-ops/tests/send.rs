@@ -380,6 +380,31 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
         .await
         .unwrap();
     assert_eq!(third.distribution_targets, vec![bob_jid.clone()]);
+    let (_, version, ciphertext) = skmsg_of(&third.stanza);
+    assert!(
+        bob.receive(ReceiveRequest {
+            chat: &group_str,
+            sender: &alice_addr,
+            kind: ReceiveKind::SenderKey,
+            ciphertext: &ciphertext,
+            padding_version: version,
+            is_from_me: false,
+        })
+        .await
+        .is_err(),
+        "the old sender-key chain must not decrypt a message after rotation"
+    );
+    let (kind, version, carrier) =
+        pairwise_enc_for(&third.stanza, &bob_jid).expect("fresh key for bob");
+    assert!(matches!(
+        receive(&kind, version, carrier).await,
+        Received::Message(_)
+    ));
+    let (_, version, ciphertext) = skmsg_of(&third.stanza);
+    assert!(matches!(
+        receive("skmsg", version, ciphertext).await,
+        Received::Message(_)
+    ));
 }
 
 /// The first `<enc>` anywhere in the stanza.
@@ -414,7 +439,7 @@ fn remote_bundle_from(bundle: &PreKeyBundle) -> wacore_signal_ops::RemoteBundle 
 }
 
 /// Decrypt the first `<enc>` of a stanza from `from` and return its text.
-async fn deliver(ops: &SignalOps<Store>, from: &Jid, stanza: Vec<u8>) -> Option<String> {
+async fn deliver_message(ops: &SignalOps<Store>, from: &Jid, stanza: Vec<u8>) -> wa::Message {
     let (kind, version, ciphertext) = first_enc(&stanza);
     let sender = from.to_protocol_address();
     let chat = from.to_non_ad().to_string();
@@ -436,7 +461,11 @@ async fn deliver(ops: &SignalOps<Store>, from: &Jid, stanza: Vec<u8>) -> Option<
     let Received::Message(message) = received else {
         panic!("expected a message")
     };
-    message.content.message.conversation
+    message.content.message
+}
+
+async fn deliver(ops: &SignalOps<Store>, from: &Jid, stanza: Vec<u8>) -> Option<String> {
+    deliver_message(ops, from, stanza).await.conversation
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -476,9 +505,22 @@ async fn a_retry_receipt_gets_the_message_re_encrypted() {
         )
         .await
         .unwrap();
+    let saved = alice.sent_message(&to, "R1").await.unwrap().unwrap();
+    let secret = saved
+        .message_context_info
+        .as_option()
+        .and_then(|context| context.message_secret.as_ref())
+        .expect("the original send generated a message secret");
+    assert_eq!(secret.len(), 32);
+    let delivered = deliver_message(&bob, &alice_jid, retried).await;
+    assert_eq!(delivered.conversation.as_deref(), Some("lost once"));
     assert_eq!(
-        deliver(&bob, &alice_jid, retried).await.as_deref(),
-        Some("lost once")
+        delivered
+            .message_context_info
+            .as_option()
+            .and_then(|context| context.message_secret.as_ref()),
+        Some(secret),
+        "retry encryption must preserve the original generated secret"
     );
 
     // Bob's device was reset: new keys arrive with the next retry receipt.

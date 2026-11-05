@@ -61,17 +61,24 @@ fn encode_sent(message: &[u8], secret: Option<&[u8; 32]>) -> Vec<u8> {
     out
 }
 
-/// `(inserted ms, message bytes)` of a sent-message record.
-fn decode_sent(record: &[u8]) -> Result<(u64, &[u8]), OpsError> {
+/// `(inserted ms, generated secret, message bytes)` of a sent-message record.
+fn decode_sent(record: &[u8]) -> Result<(u64, Option<&[u8]>, &[u8]), OpsError> {
     let corrupt = || OpsError::InvalidInput("sent-message record is corrupt".into());
     let (inserted, rest) = record.split_at_checked(8).ok_or_else(corrupt)?;
     let inserted_ms = u64::from_be_bytes(inserted.try_into().map_err(|_| corrupt())?);
-    let body = match rest.first() {
-        Some(0) => &rest[1..],
-        Some(1) if rest.len() >= 33 => &rest[33..],
+    let (secret, body) = match rest.first() {
+        Some(0) => (None, &rest[1..]),
+        Some(1) if rest.len() >= 33 => (Some(&rest[1..33]), &rest[33..]),
         _ => return Err(corrupt()),
     };
-    Ok((inserted_ms, body))
+    Ok((inserted_ms, secret, body))
+}
+
+fn dm_lock_jids(devices: &[Jid], preferred: &[Jid]) -> Vec<Jid> {
+    let mut jids: Vec<_> = devices.iter().chain(preferred).cloned().collect();
+    jids.sort_by_key(|jid| jid.to_protocol_address().as_str().to_owned());
+    jids.dedup_by_key(|jid| jid.to_protocol_address().as_str().to_owned());
+    jids
 }
 
 fn send_error(error: anyhow::Error) -> OpsError {
@@ -202,12 +209,13 @@ impl<S: ServiceStore> SignalOps<S> {
         for device in resolved.devices() {
             encryption.push(encryption_jid(resolver, device).await);
         }
-        let held_keys: Vec<String> = encryption
+        // An existing PN session remains a valid fallback even when the client
+        // knows the preferred LID. Both addresses can be written by fan-out.
+        let lock_jids = dm_lock_jids(resolved.devices(), &encryption);
+        let held_keys: Vec<String> = lock_jids
             .iter()
             .map(|jid| session_key(&jid.to_protocol_address()))
             .collect();
-        let mut lock_jids = encryption.clone();
-        lock_jids.sort_by_key(|jid| jid.to_protocol_address().as_str().to_owned());
         let _ = resolved.signal_addressing_or_init(DmSignalAddressing::new(encryption, lock_jids));
         let _held = self.lock_keys(held_keys).await;
         let staged = std::sync::Arc::new(self.store().staged());
@@ -279,10 +287,19 @@ impl<S: ServiceStore> SignalOps<S> {
         else {
             return Ok(None);
         };
-        let (_, body) = decode_sent(&record)?;
-        waproto::codec::message_decode(body)
-            .map(Some)
-            .map_err(|e| OpsError::InvalidInput(format!("sent message did not decode: {e}")))
+        let (_, secret, body) = decode_sent(&record)?;
+        let mut message = waproto::codec::message_decode(body)
+            .map_err(|e| OpsError::InvalidInput(format!("sent message did not decode: {e}")))?;
+        if let Some(secret) = secret {
+            let mut context = message
+                .message_context_info
+                .as_option()
+                .cloned()
+                .unwrap_or_default();
+            context.message_secret = Some(secret.to_vec());
+            message.message_context_info = Some(context).into();
+        }
+        Ok(Some(message))
     }
 
     /// Build a group stanza: a sender-key message for the group plus, for
@@ -481,19 +498,37 @@ impl<S: ServiceStore> SignalOps<S> {
         Ok(())
     }
 
-    /// Forget which devices hold the sender key for `group`, so the next send
-    /// distributes it again. Use after membership changes.
+    /// Rotate this device's PN and LID sender-key chains and clear distribution
+    /// marks in one fenced batch. Use after membership changes so a removed
+    /// participant cannot decrypt later messages using the previous chain.
     pub async fn forget_sender_key_devices(&self, group: &Jid) -> Result<(), OpsError> {
+        let OwnIdentity { pn, lid, .. } = self.own_identity().await?;
+        let group_str = group.to_string();
+        let addresses: Vec<_> = std::iter::once(&pn)
+            .chain(lid.iter())
+            .map(|jid| jid.to_protocol_address())
+            .collect();
+        let mut held_keys = vec![group_key(&group_str)];
+        held_keys.extend(
+            addresses
+                .iter()
+                .map(|address| chain_key(&group_str, address.as_str())),
+        );
+        let _held = self.lock_keys(held_keys).await;
+        let staged = self.store().staged();
+        for address in addresses {
+            let name = SenderKeyName::from_parts(&group_str, address.as_str());
+            staged.delete_sender_key(name.cache_key()).await?;
+        }
         let prefix = format!("{group}\u{0}");
-        let _held = self.lock_keys(vec![group_key(&group.to_string())]).await;
-        let keys = self
-            .store()
+        let keys = staged
             .scan_aux(Namespace::SenderKeyDevices, &prefix)
             .await?;
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        self.store()
+        staged
             .delete_aux(Namespace::SenderKeyDevices, &refs)
             .await?;
+        staged.commit().await?;
         Ok(())
     }
 
@@ -604,7 +639,7 @@ impl<S: ServiceStore> SignalOps<S> {
             // A record that no longer decodes cannot serve a resend; delete it
             // rather than let one corrupt entry stop every later prune.
             if let Some(record) = store.load_aux(Namespace::SentMessage, &key).await?
-                && decode_sent(&record).map_or(true, |(sent_ms, _)| sent_ms < cutoff_ms)
+                && decode_sent(&record).map_or(true, |(sent_ms, _, _)| sent_ms < cutoff_ms)
             {
                 expired.push(key);
             }
@@ -612,5 +647,21 @@ impl<S: ServiceStore> SignalOps<S> {
         let refs: Vec<&str> = expired.iter().map(String::as_str).collect();
         store.delete_aux(Namespace::SentMessage, &refs).await?;
         Ok(expired.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_message_locks_cover_the_pn_fallback_and_preferred_lid() {
+        let pn: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+        let lid: Jid = "900222:1@lid".parse().unwrap();
+        assert_eq!(
+            dm_lock_jids(&[pn.clone()], &[lid.clone()]),
+            vec![pn.clone(), lid]
+        );
+        assert_eq!(dm_lock_jids(&[pn.clone()], &[pn.clone()]), vec![pn]);
     }
 }

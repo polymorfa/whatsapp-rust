@@ -708,7 +708,8 @@ impl SignalDevice {
         })
     }
 
-    /// Make the next group send distribute the sender key again.
+    /// Atomically rotate this device's group sender keys and clear distribution
+    /// marks, so the next send uses a fresh key after membership changes.
     #[wasm_bindgen(js_name = forgetSenderKeyDevices)]
     pub fn forget_sender_key_devices(&self, group: String) -> Promise {
         let inner = self.inner.clone();
