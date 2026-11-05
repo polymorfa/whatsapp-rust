@@ -103,6 +103,13 @@ wacore-noise = { workspace = true }
 waproto = { workspace = true }
 zerocopy = { workspace = true, optional = true }
 
+# Browser/Node builds also need the randomness backend when this crate is a
+# standalone dependency. Do not rely on the root SDK to unify its features.
+# WASI and other targets keep their own backends; RUSTFLAGS still selects the
+# backend, as in the existing js feature and workspace WebAssembly workflow.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+
 [build-dependencies]
 buffa-build = { workspace = true }
 sha2 = { workspace = true }
