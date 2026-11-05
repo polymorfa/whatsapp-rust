@@ -26,7 +26,6 @@ buffa = { workspace = true }
 bytes = { workspace = true }
 diesel = { workspace = true }
 diesel_migrations = { workspace = true }
-libsqlite3-sys = { version = "0.38", default-features = false, optional = true }
 log = { workspace = true }
 # Shared across all r2d2 pools so each per-session store doesn't spawn its own pool of
 # management threads. Already in the tree transitively via r2d2 0.8.
@@ -38,6 +37,12 @@ tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 thiserror = { workspace = true }
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
+
+# Diesel uses sqlite-wasm-rs on browser/Node WASM. This helper only enables
+# native SQLite bundling; use Diesel's complementary target condition so it
+# cannot pull a native C build into the WebAssembly dependency graph.
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
+libsqlite3-sys = { version = "0.38", default-features = false, optional = true }
 
 [build-dependencies]
 buffa-build = { workspace = true }
