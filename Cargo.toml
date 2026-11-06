@@ -42,6 +42,9 @@ members = [
     "wacore/derive",
     "wacore/libsignal",
     "wacore/noise",
+    "wacore/recordstore",
+    "wacore/signal-ops",
+    "wacore/signal-wasm",
     "waproto",
 ]
 default-members = [
@@ -55,6 +58,8 @@ default-members = [
     "wacore/derive",
     "wacore/libsignal",
     "wacore/noise",
+    "wacore/recordstore",
+    "wacore/signal-ops",
     "waproto",
 ]
 
@@ -90,7 +95,7 @@ unused_qualifications = "warn"
 [workspace.dependencies]
 oracle-core = { path = "tools/oracle-core" }
 unwasm-core = { git = "https://github.com/oxidezap/unwasm.git", rev = "8f798470e9f8c22a9ef40780eee302894fe7bdce" }
-wa-store = { git = "https://github.com/oxidezap/whatspec.git", rev = "10a66fdaab616c9ef6b3f5e6b197bdddfabc142a" }
+wa-store = { git = "https://github.com/oxidezap/whatspec.git", rev = "eb16f595d455d8b0b3f7966a59444f4f9894c127" }
 xtask-support = { path = "tools/xtask-support" }
 aes = "0.9.2"
 aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc"] }

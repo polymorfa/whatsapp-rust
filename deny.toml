@@ -16,12 +16,12 @@ version = 2
 # the affected operation is structurally unreachable in this workspace and no
 # fixed dependency exists; the exact boundary must be recorded beside it.
 ignore = [
-    # OxiTLS exposes RSA signing for server/private-key users. wa-fetch is an
+    # RustCrypto exposes RSA signing for server/private-key users. wa-fetch is an
     # HTTP client with no client certificate or private key, so the Marvin
-    # private-key timing path is unreachable. No fixed pure-Rust RSA release
-    # exists; replacing the provider would reintroduce C/assembly TLS.
+    # private-key timing path is unreachable. The native adapter only verifies
+    # server signatures; it never supplies an RSA private key.
     "RUSTSEC-2023-0071",
-    # Compile-time macro dependency of OxiTLS. It contributes no runtime code,
+    # Compile-time macro dependency of the TLS provider. It contributes no runtime code,
     # and the current provider has no replacement release without it.
     "RUSTSEC-2024-0436",
 ]
@@ -69,10 +69,9 @@ wildcards = "deny"
 allow-wildcard-paths = true
 
 skip = [
-    # Current Wasmtime/Cranelift and OxiTLS sit on adjacent RustCrypto
-    # generations. Both are host-tool-only and cannot be unified from this
-    # workspace until their upstream dependency ranges converge.
-    { name = "const-oid", version = "=0.9.6" },
+    # The capture tool's pinned wa-text crate still uses sha2 0.10 for
+    # source hashing; the workspace uses 0.11. Keep the existing host-only
+    # exception until that upstream range moves.
     { name = "sha2", version = "=0.10.9" },
     # RustCrypto mid-migration. The workspace is on the 0.11/1.x line (sha2
     # 0.11, hmac 0.13, aes-gcm 0.11...); rtc-crypto, the media stack's crypto
@@ -154,8 +153,8 @@ skip = [
     # duplicate. Collapses when Wasmtime and unwasm move up.
     { name = "wasm-encoder", version = "=0.254.2" },
     { name = "wasmparser", version = "=0.254.2" },
-    { name = "zstd", version = "=0.13.3" },
-    { name = "zstd-safe", version = "=7.3.0" },
+    { name = "zstd", version = "=0.13.4" },
+    { name = "zstd-safe", version = "=7.4.0" },
 ]
 
 [sources]
@@ -167,4 +166,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/oxidezap/unwasm.git",
     "https://github.com/oxidezap/whatspec.git",
+    # wa-fetch's pure-Rust TLS provider, pinned by its reviewed upstream
+    # manifest to 70f76c039e587192688af18a80d5d6435dedaf22.
+    "https://github.com/RustCrypto/rustls-rustcrypto.git",
 ]
