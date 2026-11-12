@@ -569,3 +569,18 @@ fn replacement_must_preserve_a_valid_function_end_and_stack() {
         );
     }
 }
+
+#[test]
+fn truncated_code_sections_are_refused_without_panicking() {
+    let mut truncated_body = sample();
+    truncated_body.pop();
+    let oversized_section = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x0a, 0x28, 0x00,
+    ];
+    for malformed in [truncated_body.as_slice(), oversized_section.as_slice()] {
+        assert!(
+            patch::instrument(malformed, &Plan::every_call_in(3)).is_err(),
+            "an incomplete code section must be rejected before rewriting"
+        );
+    }
+}
