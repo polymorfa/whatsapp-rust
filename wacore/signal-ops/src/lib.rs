@@ -39,7 +39,7 @@ pub use device::{DeviceKeys, PublicIdentity, PublicPreKey, PublicSignedPreKey};
 pub use error::OpsError;
 pub use inbound::{ReceiveKind, ReceiveRequest, Received, ReceivedMessage};
 pub use ops::{
-    Decrypted, EncKind, Encrypted, PairingSignature, PreKeyUploadBatch, RemoteBundle, ServiceStore,
-    SignalOps,
+    AuthorityKey, Decrypted, EncKind, Encrypted, PairingSignature, PreKeyUploadBatch, RemoteBundle,
+    ServiceStore, SignalOps,
 };
 pub use outbound::{PreparedGroupSend, PreparedSend, RetryRequest, RetryRoute};

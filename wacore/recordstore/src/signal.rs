@@ -76,6 +76,11 @@ impl<R: RecordStore, S: Sealer> RecordSignalStore<R, S> {
         &self.fence
     }
 
+    /// The record backend shared by every store built over it.
+    pub fn records(&self) -> &Arc<R> {
+        &self.records
+    }
+
     /// Count surviving prekeys marked uploaded, refusing a superseded fence.
     /// Missing records consumed during this read are skipped. This is a
     /// count of local state, not confirmation of the provider's current pool.

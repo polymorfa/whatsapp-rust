@@ -330,16 +330,9 @@ impl SignalDevice {
     pub fn decrypt(&self, user: String, device: u32, kind: String, ciphertext: Vec<u8>) -> Promise {
         let inner = self.inner.clone();
         promise(async move {
-            let kind = match kind.as_str() {
-                "pkmsg" => EncKind::PreKey,
-                "msg" => EncKind::Message,
-                other => {
-                    return Err(convert::coded_error(
-                        "invalid_input",
-                        &format!("unsupported enc type {other}"),
-                    ));
-                }
-            };
+            let kind = EncKind::try_from(kind.as_str()).map_err(|_| {
+                convert::coded_error("invalid_input", &format!("unsupported enc type {kind}"))
+            })?;
             let result = inner
                 .ops
                 .decrypt(&address(&user, device)?, kind, &ciphertext)
@@ -370,7 +363,7 @@ impl SignalDevice {
                 .await
                 .map_err(ops_error)?;
             let out = Object::new();
-            set(&out, "kind", &JsValue::from_str(result.kind.wire()));
+            set(&out, "kind", &JsValue::from_str(result.kind.as_str()));
             set(
                 &out,
                 "ciphertext",
@@ -482,17 +475,9 @@ impl SignalDevice {
                     )
                 })?,
             };
-            let kind = match kind.as_str() {
-                "pkmsg" => ReceiveKind::PreKey,
-                "msg" => ReceiveKind::Message,
-                "skmsg" => ReceiveKind::SenderKey,
-                other => {
-                    return Err(convert::coded_error(
-                        "invalid_input",
-                        &format!("unsupported enc type {other}"),
-                    ));
-                }
-            };
+            let kind = ReceiveKind::try_from(kind.as_str()).map_err(|_| {
+                convert::coded_error("invalid_input", &format!("unsupported enc type {kind}"))
+            })?;
             let sender = address(&user, device)?;
             let received = inner
                 .ops

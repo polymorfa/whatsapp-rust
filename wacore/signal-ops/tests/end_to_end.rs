@@ -370,3 +370,28 @@ fn migrate_pn_to_lid_moves_regular_and_hosted_devices() {
         Err(OpsError::InvalidInput(_))
     ));
 }
+
+#[test]
+fn a_second_open_under_the_same_fence_shares_one_authority() {
+    let records = Arc::new(MemoryRecordStore::new());
+    let scope = "same-holder";
+    let first = block_on(SignalOps::create(store_for(&records, scope, "node-a", 0))).unwrap();
+    // Renewal by the same holder keeps the fence, so both instances write
+    // under one generation and the store cannot tell their writes apart.
+    let second = block_on(SignalOps::open(store_for(&records, scope, "node-a", 1))).unwrap();
+
+    let (a, b) = block_on(futures::future::join(
+        first.rotate_signed_prekey(),
+        second.rotate_signed_prekey(),
+    ));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a.id, b.id, "rotations under one fence must not reuse an id");
+
+    let latest = block_on(first.public_identity()).signed_prekey;
+    assert_eq!(block_on(second.public_identity()).signed_prekey, latest);
+    assert!(latest.id == a.id || latest.id == b.id);
+
+    drop((first, second));
+    let reopened = block_on(SignalOps::open(store_for(&records, scope, "node-a", 2))).unwrap();
+    assert_eq!(block_on(reopened.public_identity()).signed_prekey, latest);
+}

@@ -352,7 +352,7 @@ impl<S: ServiceStore> SignalOps<S> {
                 .await?;
         }
         staged.commit().await?;
-        *self.keys.write().await = Arc::new(keys);
+        *self.authority.keys.write().await = Arc::new(keys);
         Ok(public)
     }
 }

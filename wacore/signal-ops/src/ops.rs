@@ -21,7 +21,7 @@ use wacore::store::error::Result as StoreResult;
 use wacore::store::traits::SignalStore;
 use wacore::types::jid::JidExt;
 use wacore_binary::{Jid, Server};
-use wacore_recordstore::{Namespace, RecordSignalStore, RecordStore, Sealer};
+use wacore_recordstore::{Fence, Namespace, RecordSignalStore, RecordStore, Sealer};
 
 #[path = "prekeys.rs"]
 mod prekeys;
@@ -52,11 +52,39 @@ pub trait ServiceStore: SignalStore + Sized + 'static {
     /// Addresses with a stored session ([`Namespace::Session`]) or identity
     /// ([`Namespace::Identity`]) starting with `prefix`.
     async fn scan_peer_addresses(&self, ns: Namespace, prefix: &str) -> StoreResult<Vec<String>>;
+    /// Identifies the backend and lease fence this store writes under.
+    /// Instances with equal keys in one process share one [`SignalOps`]
+    /// authority.
+    fn authority_key(&self) -> AuthorityKey;
+}
+
+/// The record backend and lease fence behind a [`ServiceStore`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AuthorityKey {
+    backend: usize,
+    scope: Arc<str>,
+    generation: u64,
+}
+
+impl AuthorityKey {
+    /// `backend` must be the shared handle that every store over the same
+    /// records holds; it stays alive while an instance using it is open.
+    pub fn new<B: ?Sized>(backend: &Arc<B>, fence: &Fence) -> Self {
+        Self {
+            backend: Arc::as_ptr(backend).cast::<()>() as usize,
+            scope: fence.scope.clone(),
+            generation: fence.generation,
+        }
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl<R: RecordStore + 'static, S: Sealer + 'static> ServiceStore for RecordSignalStore<R, S> {
+    fn authority_key(&self) -> AuthorityKey {
+        AuthorityKey::new(self.records(), RecordSignalStore::fence(self))
+    }
+
     async fn load_device_keys(&self) -> StoreResult<Option<Vec<u8>>> {
         self.load_device().await
     }
@@ -107,21 +135,14 @@ impl<R: RecordStore + 'static, S: Sealer + 'static> ServiceStore for RecordSigna
 }
 
 /// Pairwise ciphertext kinds, named as in the `<enc type>` attribute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, wacore::WireEnum)]
 pub enum EncKind {
-    /// `pkmsg`: first message of a session, carries X3DH material.
+    /// First message of a session, carries X3DH material.
+    #[wire = "pkmsg"]
     PreKey,
-    /// `msg`: a message on an established session.
+    /// A message on an established session.
+    #[wire = "msg"]
     Message,
-}
-
-impl EncKind {
-    pub fn wire(self) -> &'static str {
-        match self {
-            EncKind::PreKey => "pkmsg",
-            EncKind::Message => "msg",
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,12 +259,47 @@ pub(crate) fn group_key(group: &str) -> String {
 /// store's lease fencing protects against a second node.
 pub struct SignalOps<S> {
     store: Arc<S>,
+    authority: Arc<Authority>,
+}
+
+/// Cached keys, locks and the usability flag for one lease fence. A second
+/// instance opened under the same fence shares them instead of creating an
+/// independent authority whose writes the fence would also accept.
+struct Authority {
     keys: RwLock<Arc<DeviceKeys>>,
     /// Held while device keys are read-modify-written.
     device_write: Arc<Mutex<()>>,
     usable: Arc<std::sync::atomic::AtomicBool>,
     locks: Arc<KeyedLocks>,
     sender_key_locks: Arc<KeyedLocks>,
+}
+
+fn authorities()
+-> &'static std::sync::Mutex<std::collections::HashMap<AuthorityKey, std::sync::Weak<Authority>>> {
+    static AUTHORITIES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<AuthorityKey, std::sync::Weak<Authority>>>,
+    > = std::sync::OnceLock::new();
+    AUTHORITIES.get_or_init(Default::default)
+}
+
+/// Return the live authority for `key`, or register one built from `keys`.
+fn shared_authority(key: AuthorityKey, keys: impl FnOnce() -> DeviceKeys) -> Arc<Authority> {
+    let mut map = authorities()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(live) = map.get(&key).and_then(std::sync::Weak::upgrade) {
+        return live;
+    }
+    map.retain(|_, weak| weak.strong_count() > 0);
+    let authority = Arc::new(Authority {
+        keys: RwLock::new(Arc::new(keys())),
+        device_write: Arc::new(Mutex::new(())),
+        usable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        locks: Arc::new(KeyedLocks::default()),
+        sender_key_locks: Arc::new(KeyedLocks::default()),
+    });
+    map.insert(key, Arc::downgrade(&authority));
+    authority
 }
 
 fn rng() -> rand::rngs::StdRng {
@@ -256,13 +312,16 @@ fn public_key(bytes: &[u8; 32], what: &str) -> Result<PublicKey, OpsError> {
 }
 
 impl<S: ServiceStore> SignalOps<S> {
-    /// Open a scope that already has device keys.
+    /// Open a scope that already has device keys. Opening a scope again under
+    /// the same fence while an instance is live shares that instance's keys,
+    /// locks and retirement state.
     pub async fn open(store: Arc<S>) -> Result<Self, OpsError> {
         let blob = store
             .load_device_keys()
             .await?
             .ok_or(OpsError::NotInitialised)?;
-        Ok(Self::with_keys(store, DeviceKeys::decode(&blob)?))
+        let keys = DeviceKeys::decode(&blob)?;
+        Ok(Self::with_keys(store, keys))
     }
 
     /// Generate and persist device keys for a new scope. Refuses to replace
@@ -280,14 +339,8 @@ impl<S: ServiceStore> SignalOps<S> {
     }
 
     fn with_keys(store: Arc<S>, keys: DeviceKeys) -> Self {
-        Self {
-            store,
-            keys: RwLock::new(Arc::new(keys)),
-            device_write: Arc::new(Mutex::new(())),
-            usable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            locks: Arc::new(KeyedLocks::default()),
-            sender_key_locks: Arc::new(KeyedLocks::default()),
-        }
+        let authority = shared_authority(store.authority_key(), || keys);
+        Self { store, authority }
     }
 
     async fn stores(&self) -> Stores<S> {
@@ -297,8 +350,8 @@ impl<S: ServiceStore> SignalOps<S> {
     pub(crate) async fn stores_over(&self, store: Arc<S>) -> Stores<S> {
         Stores {
             store,
-            keys: self.keys.read().await.clone(),
-            sender_key_locks: self.sender_key_locks.clone(),
+            keys: self.authority.keys.read().await.clone(),
+            sender_key_locks: self.authority.sender_key_locks.clone(),
         }
     }
 
@@ -310,7 +363,9 @@ impl<S: ServiceStore> SignalOps<S> {
     /// locked operation retires it; release the lease and use a higher fence
     /// before constructing its replacement.
     pub fn is_usable(&self) -> bool {
-        self.usable.load(std::sync::atomic::Ordering::SeqCst)
+        self.authority
+            .usable
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn require_usable(&self) -> Result<(), OpsError> {
@@ -323,9 +378,9 @@ impl<S: ServiceStore> SignalOps<S> {
 
     pub(crate) async fn lock_device(&self) -> Result<Held, OpsError> {
         self.require_usable()?;
-        let held = self.device_write.lock_arc().await;
+        let held = self.authority.device_write.lock_arc().await;
         self.require_usable()?;
-        Ok(Held::new(vec![held], self.usable.clone()))
+        Ok(Held::new(vec![held], self.authority.usable.clone()))
     }
 
     /// Acquire sorted state locks, then check for a cancelled predecessor.
@@ -335,14 +390,14 @@ impl<S: ServiceStore> SignalOps<S> {
         keys.dedup();
         let mut held = Vec::with_capacity(keys.len());
         for key in keys {
-            held.push(self.locks.get(&key).lock_arc().await);
+            held.push(self.authority.locks.get(&key).lock_arc().await);
         }
         self.require_usable()?;
-        Ok(Held::new(held, self.usable.clone()))
+        Ok(Held::new(held, self.authority.usable.clone()))
     }
 
     pub(crate) async fn keys(&self) -> Arc<DeviceKeys> {
-        self.keys.read().await.clone()
+        self.authority.keys.read().await.clone()
     }
 
     /// Record this device's own JIDs once the client knows them (after pair
@@ -354,7 +409,7 @@ impl<S: ServiceStore> SignalOps<S> {
         }
         let held = self.lock_device().await?;
         held.run(async {
-            let mut keys = (**self.keys.read().await).clone();
+            let mut keys = (**self.authority.keys.read().await).clone();
             keys.own_pn = Some(pn.to_owned());
             keys.own_lid = lid.map(str::to_owned);
             self.replace_keys(keys).await
@@ -364,12 +419,12 @@ impl<S: ServiceStore> SignalOps<S> {
 
     async fn replace_keys(&self, keys: DeviceKeys) -> Result<(), OpsError> {
         self.store.save_device_keys(&keys.encode()).await?;
-        *self.keys.write().await = Arc::new(keys);
+        *self.authority.keys.write().await = Arc::new(keys);
         Ok(())
     }
 
     pub async fn public_identity(&self) -> PublicIdentity {
-        self.keys.read().await.public()
+        self.authority.keys.read().await.public()
     }
 
     /// Generate fresh one-time prekeys for retry receipts. Unlike
@@ -391,7 +446,7 @@ impl<S: ServiceStore> SignalOps<S> {
     pub async fn rotate_signed_prekey(&self) -> Result<PublicSignedPreKey, OpsError> {
         let held = self.lock_device().await?;
         held.run(async {
-            let mut keys = (**self.keys.read().await).clone();
+            let mut keys = (**self.authority.keys.read().await).clone();
             let retired = record_helpers::new_signed_pre_key_record(
                 keys.signed_prekey_id,
                 &keys.signed_prekey,
@@ -778,7 +833,7 @@ impl<S: ServiceStore> SignalOps<S> {
         &self,
         device_identity_container: &[u8],
     ) -> Result<PairingSignature, OpsError> {
-        let keys = self.keys.read().await.clone();
+        let keys = self.authority.keys.read().await.clone();
         let (signed_identity, key_index) = PairUtils::do_pair_crypto_with(
             &keys.identity,
             &keys.adv_secret,
@@ -791,7 +846,7 @@ impl<S: ServiceStore> SignalOps<S> {
         // Kept for prekey messages, which carry the device identity.
         let held = self.lock_device().await?;
         held.run(async {
-            let mut updated = (**self.keys.read().await).clone();
+            let mut updated = (**self.authority.keys.read().await).clone();
             updated.account = Some(signed_identity.clone());
             self.replace_keys(updated).await?;
             Ok(PairingSignature {

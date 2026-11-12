@@ -5225,6 +5225,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "rand 0.10.3",
+ "serde",
  "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",

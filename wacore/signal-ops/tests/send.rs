@@ -219,11 +219,7 @@ async fn receive_group_component(
     ops.receive(ReceiveRequest {
         chat: &group.to_string(),
         sender: &from.to_protocol_address(),
-        kind: match kind.as_str() {
-            "pkmsg" => ReceiveKind::PreKey,
-            "msg" => ReceiveKind::Message,
-            _ => ReceiveKind::SenderKey,
-        },
+        kind: ReceiveKind::try_from(kind.as_str()).expect("enc type"),
         ciphertext: &ciphertext,
         padding_version: version,
         is_from_me: false,
@@ -392,11 +388,7 @@ async fn a_group_send_distributes_the_sender_key_once_then_reuses_it() {
     let receive = |kind: &str, version: u8, ciphertext: Vec<u8>| {
         let sender = alice_addr.clone();
         let chat = group_str.clone();
-        let kind = match kind {
-            "pkmsg" => ReceiveKind::PreKey,
-            "msg" => ReceiveKind::Message,
-            _ => ReceiveKind::SenderKey,
-        };
+        let kind = ReceiveKind::try_from(kind).expect("enc type");
         let bob = &bob;
         async move {
             bob.receive(ReceiveRequest {

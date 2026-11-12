@@ -20,24 +20,15 @@ const STATE_DELIVERED: u8 = 2;
 const HEADER_LEN: usize = 1 + 1 + 1 + 8;
 
 /// The `<enc type>` of a received payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, wacore::WireEnum)]
 pub enum ReceiveKind {
-    /// `pkmsg`
+    #[wire = "pkmsg"]
     PreKey,
-    /// `msg`
+    #[wire = "msg"]
     Message,
-    /// `skmsg`: group sender-key message for the request's chat.
+    /// Group sender-key message for the request's chat.
+    #[wire = "skmsg"]
     SenderKey,
-}
-
-impl ReceiveKind {
-    fn wire(self) -> &'static str {
-        match self {
-            ReceiveKind::PreKey => "pkmsg",
-            ReceiveKind::Message => "msg",
-            ReceiveKind::SenderKey => "skmsg",
-        }
-    }
 }
 
 /// One `<enc>` payload from a `<message>` stanza.
@@ -87,7 +78,7 @@ pub struct ReceivedMessage {
 fn receipt_key(request: &ReceiveRequest<'_>) -> String {
     let mut hasher = Sha256::new();
     for part in [
-        request.kind.wire().as_bytes(),
+        request.kind.as_str().as_bytes(),
         request.chat.as_bytes(),
         request.sender.as_str().as_bytes(),
     ] {
