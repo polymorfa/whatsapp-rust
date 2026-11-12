@@ -30,7 +30,7 @@ log = { workspace = true }
 # Shared across all r2d2 pools so each per-session store doesn't spawn its own pool of
 # management threads. Already in the tree transitively via r2d2 0.8.
 # 0.2.8 requires parking_lot 0.13 and Rust 1.95. Keep published MSRV 1.94.
-scheduled-thread-pool = ">=0.2.7, <0.2.9"
+scheduled-thread-pool = ">=0.2.7, <0.2.8"
 serde_json = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 thiserror = { workspace = true }
