@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! A cancelled state-changing operation retires its instance before unlocking.
 
