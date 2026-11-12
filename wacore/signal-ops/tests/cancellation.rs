@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+// Copyright (C) 2026 Polymorfa (Softium LLC)
 
 //! Submitted storage writes may outlive the caller that awaited them.
 #![cfg(not(target_arch = "wasm32"))]
