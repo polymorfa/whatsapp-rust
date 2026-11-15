@@ -75,7 +75,7 @@ pub struct ReceivedMessage {
     pub app_state_key_share: Option<wa::message::AppStateSyncKeyShare>,
 }
 
-fn receipt_key(request: &ReceiveRequest<'_>) -> String {
+fn receipt_key(request: &ReceiveRequest<'_>, status_session: bool) -> String {
     let mut hasher = Sha256::new();
     for part in [
         request.kind.as_str().as_bytes(),
@@ -84,6 +84,9 @@ fn receipt_key(request: &ReceiveRequest<'_>) -> String {
     ] {
         hasher.update(part);
         hasher.update([0]);
+    }
+    if status_session {
+        hasher.update(b"status-session\0");
     }
     hasher.update(request.ciphertext);
     hex::encode(hasher.finalize())
@@ -183,7 +186,31 @@ impl<S: ServiceStore> SignalOps<S> {
     /// Decrypt, buffer and classify one received payload. Sender-key
     /// distributions inside it are stored in the same batch as the decrypt.
     pub async fn receive(&self, request: ReceiveRequest<'_>) -> Result<Received, OpsError> {
-        let receipt_key = receipt_key(&request);
+        self.receive_scoped(request, false).await
+    }
+
+    /// Receive a status using a separate pairwise session when selected by
+    /// the caller's served configuration. Identity/prekeys and sender keys
+    /// remain shared. This does not enable status publishing.
+    pub async fn receive_status(
+        &self,
+        request: ReceiveRequest<'_>,
+        status_session: bool,
+    ) -> Result<Received, OpsError> {
+        if status_session && request.kind == ReceiveKind::SenderKey {
+            return Err(OpsError::InvalidInput(
+                "sender keys cannot use a pairwise status session".into(),
+            ));
+        }
+        self.receive_scoped(request, status_session).await
+    }
+
+    async fn receive_scoped(
+        &self,
+        request: ReceiveRequest<'_>,
+        status_session: bool,
+    ) -> Result<Received, OpsError> {
+        let receipt_key = receipt_key(&request, status_session);
         // Pairwise payloads can carry a sender-key distribution for this chat,
         // so they also lock the sender's chain.
         let chain = chain_key(request.chat, request.sender.as_str());
@@ -226,7 +253,13 @@ impl<S: ServiceStore> SignalOps<S> {
                         EncKind::Message
                     };
                     let decrypted = self
-                        .decrypt_into(&staged, request.sender, kind, request.ciphertext)
+                        .decrypt_into_scoped(
+                            &staged,
+                            request.sender,
+                            kind,
+                            request.ciphertext,
+                            status_session,
+                        )
                         .await?;
                     (decrypted.plaintext, decrypted.identity_changed)
                 }

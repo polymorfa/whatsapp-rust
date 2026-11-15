@@ -43,6 +43,7 @@ where
 
 pub(crate) struct Stores<S> {
     pub store: Arc<S>,
+    pub status_session: bool,
     pub keys: Arc<DeviceKeys>,
     pub sender_key_locks: Arc<KeyedLocks>,
 }
@@ -51,6 +52,7 @@ impl<S> Clone for Stores<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            status_session: self.status_session,
             keys: self.keys.clone(),
             sender_key_locks: self.sender_key_locks.clone(),
         }
@@ -83,7 +85,11 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
     async fn load_session(&self, address: &ProtocolAddress) -> SignalResult<Option<SessionRecord>> {
         match self
             .store
-            .get_session(address.as_str())
+            .get_session(&if self.status_session {
+                format!("{}_status", address.as_str())
+            } else {
+                address.as_str().to_owned()
+            })
             .await
             .map_err(backend("load_session"))?
         {
@@ -97,7 +103,11 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
 
     async fn has_session(&self, address: &ProtocolAddress) -> SignalResult<bool> {
         self.store
-            .has_session(address.as_str())
+            .has_session(&if self.status_session {
+                format!("{}_status", address.as_str())
+            } else {
+                address.as_str().to_owned()
+            })
             .await
             .map_err(backend("has_session"))
     }
@@ -110,7 +120,14 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
         let mut bytes = Vec::new();
         record.serialize_into_for_store(&mut bytes, incarnation());
         self.store
-            .put_session(address.as_str(), &bytes)
+            .put_session(
+                &if self.status_session {
+                    format!("{}_status", address.as_str())
+                } else {
+                    address.as_str().to_owned()
+                },
+                &bytes,
+            )
             .await
             .map_err(backend("store_session"))
     }

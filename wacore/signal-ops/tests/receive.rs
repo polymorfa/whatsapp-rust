@@ -5,7 +5,11 @@ use futures::executor::block_on;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{DeviceId, ProtocolAddress};
 use wacore::messages::MessageUtils;
+use wacore::store::traits::SignalStore;
+use wacore::types::jid::JidExt;
+use wacore_binary::Jid;
 use wacore_recordstore::{AesGcmSealer, LeaseStore, MemoryRecordStore, RecordSignalStore};
+use wacore_recordstore::{Namespace, RecordStore};
 use wacore_signal_ops::{
     Encrypted, ReceiveKind, ReceiveRequest, Received, ReceivedMessage, RemoteBundle, SignalOps,
 };
@@ -20,6 +24,7 @@ struct Device {
     records: Arc<MemoryRecordStore>,
     scope: &'static str,
     ops: SignalOps<Store>,
+    store: Arc<Store>,
 }
 
 fn store_for(records: &Arc<MemoryRecordStore>, scope: &str, holder: &str, now: u64) -> Arc<Store> {
@@ -35,11 +40,13 @@ fn store_for(records: &Arc<MemoryRecordStore>, scope: &str, holder: &str, now: u
 
 fn device(scope: &'static str) -> Device {
     let records = Arc::new(MemoryRecordStore::new());
-    let ops = block_on(SignalOps::create(store_for(&records, scope, "node-a", 0))).unwrap();
+    let store = store_for(&records, scope, "node-a", 0);
+    let ops = block_on(SignalOps::create(store.clone())).unwrap();
     Device {
         records,
         scope,
         ops,
+        store,
     }
 }
 
@@ -328,4 +335,110 @@ fn a_bad_sender_key_does_not_block_the_message_carrying_it() {
     );
     // Committed: a redelivery is served from the buffer, not decrypted again.
     assert!(message(block_on(bob.ops.receive(req)).unwrap()).redelivered);
+}
+
+#[test]
+fn status_ratchets_alternate_without_changing_chat_state_and_follow_identity_migration() {
+    let alice = device("alice-status");
+    let bob = device("bob-status");
+    let alice_addr = "111:1@s.whatsapp.net"
+        .parse::<Jid>()
+        .unwrap()
+        .to_protocol_address();
+    let bob_addr = "222:1@s.whatsapp.net"
+        .parse::<Jid>()
+        .unwrap()
+        .to_protocol_address();
+    let mut sender_sessions = Vec::new();
+    for status in [false, true] {
+        connect(&alice, &bob, &bob_addr);
+        let body = if status { "status first" } else { "chat first" };
+        let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&text(body)))).unwrap();
+        let req = request(
+            if status {
+                "status@broadcast"
+            } else {
+                "111@s.whatsapp.net"
+            },
+            &alice_addr,
+            kind(&sent),
+            &sent.ciphertext,
+            false,
+        );
+        let received = message(block_on(bob.ops.receive_status(req, status)).unwrap());
+        assert_eq!(received.content.message.conversation.as_deref(), Some(body));
+        let repeated = message(block_on(bob.ops.receive_status(req, status)).unwrap());
+        assert!(repeated.redelivered);
+        block_on(bob.ops.mark_delivered(&received.receipt_key)).unwrap();
+        assert!(matches!(
+            block_on(bob.ops.receive_status(req, status)).unwrap(),
+            Received::AlreadyDelivered { .. }
+        ));
+        sender_sessions.push(
+            block_on(alice.store.get_session(bob_addr.as_str()))
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    for i in 0..4 {
+        let status = i % 2 == 1;
+        block_on(
+            alice
+                .store
+                .put_session(bob_addr.as_str(), &sender_sessions[i % 2]),
+        )
+        .unwrap();
+        let body = format!("authored alternating {i}");
+        let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&text(&body)))).unwrap();
+        sender_sessions[i % 2] = block_on(alice.store.get_session(bob_addr.as_str()))
+            .unwrap()
+            .unwrap();
+        let req = request(
+            if status {
+                "status@broadcast"
+            } else {
+                "111@s.whatsapp.net"
+            },
+            &alice_addr,
+            kind(&sent),
+            &sent.ciphertext,
+            false,
+        );
+        let received = message(block_on(bob.ops.receive_status(req, status)).unwrap());
+        assert_eq!(
+            received.content.message.conversation.as_deref(),
+            Some(body.as_str())
+        );
+        assert!(!received.identity_changed);
+    }
+    let pn: Jid = "111@s.whatsapp.net".parse().unwrap();
+    let lid: Jid = "333@lid".parse().unwrap();
+    assert_eq!(block_on(bob.ops.migrate_pn_to_lid(&pn, &lid)).unwrap(), 1);
+    let migrated: Jid = "333:1@lid".parse().unwrap();
+    let address = migrated.to_protocol_address();
+    let keys = block_on(
+        bob.records
+            .scan_keys(bob.scope, Namespace::Session, "", None),
+    )
+    .unwrap();
+    assert_eq!(keys.len(), 2);
+    assert!(keys.contains(&address.as_str().to_owned()));
+    assert!(keys.contains(&format!("{}_status", address.as_str())));
+    block_on(bob.ops.forget_user(&lid)).unwrap();
+    assert!(
+        block_on(
+            bob.records
+                .scan_keys(bob.scope, Namespace::Session, "", None)
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert!(
+        block_on(
+            bob.records
+                .scan_keys(bob.scope, Namespace::Identity, "", None)
+        )
+        .unwrap()
+        .is_empty()
+    );
 }
