@@ -442,3 +442,49 @@ fn status_ratchets_alternate_without_changing_chat_state_and_follow_identity_mig
         .is_empty()
     );
 }
+
+#[test]
+fn delivered_group_publications_keep_only_classification_for_legacy_receipts() {
+    let alice = device("alice-legacy-group-status");
+    let bob = device("bob-legacy-group-status");
+    let (alice_addr, bob_addr) = (address("111"), address("222"));
+    connect(&alice, &bob, &bob_addr);
+    let publication = wa::Message {
+        group_status_message_v2: wa::message::FutureProofMessage {
+            message: text("authored publication").into(),
+        }
+        .into(),
+        ..Default::default()
+    };
+    let sent = block_on(alice.ops.encrypt(&bob_addr, &padded(&publication))).unwrap();
+    let request = request(GROUP, &alice_addr, kind(&sent), &sent.ciphertext, false);
+    let first = message(block_on(bob.ops.receive(request)).unwrap());
+    assert!(first.content.message.group_status_message_v2.is_set());
+    block_on(bob.ops.mark_delivered(&first.receipt_key)).unwrap();
+    assert!(matches!(
+        block_on(bob.ops.receive(request)).unwrap(),
+        Received::AlreadyDelivered {
+            group_status_wrapper: Some(true),
+            ..
+        }
+    ));
+    let mut legacy_marker = block_on(
+        bob.store
+            .load_aux(Namespace::DecryptBuffer, &first.receipt_key),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(legacy_marker.pop(), Some(1));
+    block_on(
+        bob.store
+            .put_aux(Namespace::DecryptBuffer, &first.receipt_key, &legacy_marker),
+    )
+    .unwrap();
+    assert!(matches!(
+        block_on(bob.ops.receive(request)).unwrap(),
+        Received::AlreadyDelivered {
+            group_status_wrapper: None,
+            ..
+        }
+    ));
+}

@@ -52,6 +52,8 @@ pub enum Received {
     /// Delivered before; the client only needs to send its receipt again.
     AlreadyDelivered {
         receipt_key: String,
+        /// Classification retained in the delivered marker, without plaintext.
+        group_status_wrapper: Option<bool>,
     },
 }
 
@@ -132,13 +134,17 @@ impl BufferEntry {
         })
     }
 
-    fn delivered(inserted_ms: u64) -> Self {
+    fn delivered(inserted_ms: u64, group_status_wrapper: Option<bool>) -> Self {
         Self {
             state: STATE_DELIVERED,
             padding_version: 0,
             identity_changed: false,
             inserted_ms,
-            padded_plaintext: Vec::new(),
+            // A delivered marker never carries message content. Older readers
+            // ignore its trailing metadata; empty legacy markers stay unknown.
+            padded_plaintext: group_status_wrapper
+                .map(|flag| vec![u8::from(flag)])
+                .unwrap_or_default(),
         }
     }
 }
@@ -227,7 +233,14 @@ impl<S: ServiceStore> SignalOps<S> {
             {
                 let entry = BufferEntry::decode(bytes)?;
                 if entry.state == STATE_DELIVERED {
-                    return Ok(Received::AlreadyDelivered { receipt_key });
+                    return Ok(Received::AlreadyDelivered {
+                        receipt_key,
+                        group_status_wrapper: match entry.padded_plaintext.as_slice() {
+                            [0] => Some(false),
+                            [1] => Some(true),
+                            _ => None,
+                        },
+                    });
                 }
                 let content = classify(
                     &entry.padded_plaintext,
@@ -285,7 +298,7 @@ impl<S: ServiceStore> SignalOps<S> {
                         .put_aux(
                             Namespace::DecryptBuffer,
                             &receipt_key,
-                            &BufferEntry::delivered(inserted_ms).encode(),
+                            &BufferEntry::delivered(inserted_ms, None).encode(),
                         )
                         .await?;
                     staged.commit().await?;
@@ -350,7 +363,13 @@ impl<S: ServiceStore> SignalOps<S> {
                     .put_aux(
                         Namespace::DecryptBuffer,
                         receipt_key,
-                        &BufferEntry::delivered(entry.inserted_ms).encode(),
+                        &BufferEntry::delivered(
+                            entry.inserted_ms,
+                            classify(&entry.padded_plaintext, entry.padding_version, true)
+                                .ok()
+                                .map(|content| content.message.group_status_message_v2.is_set()),
+                        )
+                        .encode(),
                     )
                     .await?;
             }
