@@ -192,6 +192,11 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
         session.discard();
     }
 
+    if result.is_ok() {
+        session_store
+            .on_prekey_bundle_accepted(remote_address, their_identity_key)
+            .await?;
+    }
     result
 }
 

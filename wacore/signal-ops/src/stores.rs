@@ -41,6 +41,35 @@ where
     move |e| SignalProtocolError::BackendError(context, e.into())
 }
 
+// Keep sibling ratchets only when they belong to the accepted identity. A
+// delayed archived message can temporarily change the shared identity row.
+pub(crate) async fn invalidate_sibling_identity<S: SignalStore>(
+    store: &S,
+    key: &str,
+    accepted: &IdentityKey,
+) -> SignalResult<()> {
+    if let Some(bytes) = store
+        .get_session(key)
+        .await
+        .map_err(backend("load sibling session"))?
+    {
+        let record = SessionRecord::deserialize_for_store(&bytes, incarnation())?;
+        if let Some(state) = record.session_state() {
+            let identity = state.remote_identity_key().map_err(|_| {
+                SignalProtocolError::InvalidArgument("invalid sibling session identity".into())
+            })?;
+            if identity.as_ref() == Some(accepted) {
+                return Ok(());
+            }
+        }
+        store
+            .delete_session(key)
+            .await
+            .map_err(backend("delete sibling session"))?;
+    }
+    Ok(())
+}
+
 pub(crate) struct Stores<S> {
     pub store: Arc<S>,
     pub status_session: bool,
@@ -99,6 +128,19 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
             )?)),
             None => Ok(None),
         }
+    }
+
+    async fn on_prekey_bundle_accepted(
+        &mut self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> SignalResult<()> {
+        let sibling = if self.status_session {
+            address.as_str().to_owned()
+        } else {
+            format!("{}_status", address.as_str())
+        };
+        invalidate_sibling_identity(self.store.as_ref(), &sibling, identity).await
     }
 
     async fn has_session(&self, address: &ProtocolAddress) -> SignalResult<bool> {

@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{
     CiphertextMessageType, DeviceId, IdentityKey, KeyPair, PreKeyBundle, PreKeySignalMessage,
-    ProtocolAddress, PublicKey, SenderKeyDistributionMessage, SessionRecord, SignalMessage,
-    UsePQRatchet, create_sender_key_distribution_message, group_decrypt, group_encrypt,
-    message_decrypt_prekey, message_decrypt_signal, message_encrypt, process_prekey_bundle,
+    ProtocolAddress, PublicKey, SenderKeyDistributionMessage, SignalMessage, UsePQRatchet,
+    create_sender_key_distribution_message, group_decrypt, group_encrypt, message_decrypt_prekey,
+    message_decrypt_signal, message_encrypt, process_prekey_bundle,
     process_sender_key_distribution_message,
 };
 use wacore::libsignal::store::record_helpers;
@@ -627,7 +627,7 @@ impl<S: ServiceStore> SignalOps<S> {
         let bundle = bundle.to_prekey_bundle()?;
         let mut sessions = self.stores_over(staged.clone()).await;
         let mut identities = sessions.clone();
-        let identity_change = process_prekey_bundle(
+        process_prekey_bundle(
             address,
             &mut sessions,
             &mut identities,
@@ -636,41 +636,6 @@ impl<S: ServiceStore> SignalOps<S> {
             UsePQRatchet::No,
         )
         .await?;
-        if matches!(
-            identity_change,
-            wacore::libsignal::protocol::IdentityChange::ReplacedExisting
-        ) {
-            self.invalidate_sibling_identity(
-                staged,
-                &format!("{}_status", address.as_str()),
-                bundle.identity_key()?,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    // The identity row may reflect a delayed archived prekey, while the
-    // sibling ratchet already belongs to the identity being accepted.
-    async fn invalidate_sibling_identity(
-        &self,
-        staged: &Arc<S>,
-        key: &str,
-        accepted: &IdentityKey,
-    ) -> Result<(), OpsError> {
-        if let Some(bytes) = staged.get_session(key).await? {
-            let record =
-                SessionRecord::deserialize_for_store(&bytes, crate::stores::incarnation())?;
-            if let Some(state) = record.session_state() {
-                let identity = state.remote_identity_key().map_err(|_| {
-                    OpsError::InvalidInput("invalid sibling session identity".into())
-                })?;
-                if identity.as_ref() == Some(accepted) {
-                    return Ok(());
-                }
-            }
-            staged.delete_session(key).await?;
-        }
         Ok(())
     }
 
@@ -762,8 +727,7 @@ impl<S: ServiceStore> SignalOps<S> {
                 PublicKey::from_djb_public_key_bytes(&identity)
                     .map_err(wacore::libsignal::protocol::SignalProtocolError::from)?,
             );
-            self.invalidate_sibling_identity(staged, &other, &accepted)
-                .await?;
+            crate::stores::invalidate_sibling_identity(staged.as_ref(), &other, &accepted).await?;
         }
         Ok(Decrypted {
             plaintext: result.plaintext,
