@@ -627,7 +627,7 @@ impl<S: ServiceStore> SignalOps<S> {
         let bundle = bundle.to_prekey_bundle()?;
         let mut sessions = self.stores_over(staged.clone()).await;
         let mut identities = sessions.clone();
-        process_prekey_bundle(
+        let identity_change = process_prekey_bundle(
             address,
             &mut sessions,
             &mut identities,
@@ -636,6 +636,14 @@ impl<S: ServiceStore> SignalOps<S> {
             UsePQRatchet::No,
         )
         .await?;
+        if matches!(
+            identity_change,
+            wacore::libsignal::protocol::IdentityChange::ReplacedExisting
+        ) {
+            staged
+                .delete_session(&format!("{}_status", address.as_str()))
+                .await?;
+        }
         Ok(())
     }
 

@@ -488,3 +488,54 @@ fn delivered_group_publications_keep_only_classification_for_legacy_receipts() {
         }
     ));
 }
+
+#[test]
+fn outbound_identity_replacement_invalidates_the_old_status_session() {
+    let old_peer = device("old-peer");
+    let new_peer = device("new-peer");
+    let receiver = device("identity-receiver");
+    let peer_addr = address("111");
+    let receiver_addr = address("222");
+    connect(&old_peer, &receiver, &receiver_addr);
+    let sent = block_on(
+        old_peer
+            .ops
+            .encrypt(&receiver_addr, &padded(&text("authored old status"))),
+    )
+    .unwrap();
+    let req = request(
+        "status@broadcast",
+        &peer_addr,
+        kind(&sent),
+        &sent.ciphertext,
+        false,
+    );
+    message(block_on(receiver.ops.receive_status(req, true)).unwrap());
+    let status_key = format!("{}_status", peer_addr.as_str());
+    let old_status = block_on(receiver.store.get_session(&status_key))
+        .unwrap()
+        .unwrap();
+    connect(&receiver, &old_peer, &peer_addr);
+    assert_eq!(
+        block_on(receiver.store.get_session(&status_key)).unwrap(),
+        Some(old_status)
+    );
+    connect(&receiver, &new_peer, &peer_addr);
+    assert!(
+        block_on(receiver.store.get_session(&status_key))
+            .unwrap()
+            .is_none()
+    );
+    let expected = padded(&text("authored new chat"));
+    let sent = block_on(receiver.ops.encrypt(&peer_addr, &expected)).unwrap();
+    assert_eq!(
+        block_on(
+            new_peer
+                .ops
+                .decrypt(&receiver_addr, sent.kind, &sent.ciphertext)
+        )
+        .unwrap()
+        .plaintext,
+        expected
+    );
+}
