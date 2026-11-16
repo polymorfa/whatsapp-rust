@@ -30,6 +30,11 @@ pub enum SignalProtocolError {
         #[source] Box<dyn std::error::Error + Send + Sync>,
     ),
 
+    /// A verified bundle changed local state, but its store could not finalize it.
+    /// Callers must abort the surrounding batch rather than skip this device.
+    #[error("prekey bundle local finalization failed")]
+    PreKeyBundleFinalizationFailed(#[source] Box<SignalProtocolError>),
+
     #[error("protobuf encoding was invalid")]
     InvalidProtobufEncoding,
 

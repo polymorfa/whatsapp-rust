@@ -179,6 +179,8 @@ const INLINE_ENCRYPT_DEVICES: usize = 5;
 enum SessionOutcome {
     /// Session ready; `Some` when establishing it replaced a stored identity.
     Established(Option<Jid>),
+    /// Local writes may exist; the enclosing staged batch must not commit.
+    Abort(anyhow::Error),
     /// Dropped here, so the encrypt fan-out must not count it a second time.
     /// `reason` is `None` when the prekey fetch already counted the drop, which
     /// is the case for a device the server named.
@@ -1041,6 +1043,7 @@ pub async fn ensure_sessions_for_devices_resolved(
                                 Some(encryption_jid.unwrap_or(lookup_jid)),
                             ),
                             Ok(IdentityChange::NewOrUnchanged) => SessionOutcome::Established(None),
+                            Err(error @ crate::libsignal::protocol::SignalProtocolError::PreKeyBundleFinalizationFailed(_)) => SessionOutcome::Abort(error.into()),
                             Err(error) => SessionOutcome::Dropped {
                                 jid: lookup_jid,
                                 reason: Some(UnkeyableDevice::SessionSetup),
@@ -1055,25 +1058,20 @@ pub async fn ensure_sessions_for_devices_resolved(
             });
             in_flight.push(async move { (chunk_len, task.await) });
         }
-        while let Some((chunk_len, spawn_result)) = in_flight.next().await {
+        while let Some((_chunk_len, spawn_result)) = in_flight.next().await {
             let outcomes = match spawn_result {
                 Ok(outcomes) => outcomes,
                 Err(error) => {
-                    // The task took the devices' identities with it, so these
-                    // drops cannot join `unkeyed_devices` — and must not be
-                    // counted here either, or the encrypt fan-out (which will
-                    // fail for the same devices) would count them a second time.
-                    log::warn!(
-                        "Session-establishment task did not deliver a result; skipping {chunk_len} device(s)."
-                    );
-                    if first_error.is_none() {
-                        first_error = Some(anyhow::Error::new(error));
-                    }
-                    continue;
+                    // A lost task can have staged local writes without reporting
+                    // which bundle completed. Do not commit a partial cohort.
+                    return Err(crate::libsignal::protocol::SignalProtocolError::PreKeyBundleFinalizationFailed(Box::new(
+                        crate::libsignal::protocol::SignalProtocolError::BackendError("session-establishment task", Box::new(error))
+                    )).into());
                 }
             };
             for outcome in outcomes {
                 match outcome {
+                    SessionOutcome::Abort(error) => return Err(error),
                     // Some(jid) => establishing this session replaced a stored
                     // identity; notify the client so it can react off-path.
                     SessionOutcome::Established(Some(changed_jid)) => {
