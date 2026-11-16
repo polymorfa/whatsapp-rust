@@ -539,3 +539,70 @@ fn outbound_identity_replacement_invalidates_the_old_status_session() {
         expected
     );
 }
+
+#[test]
+fn delayed_archived_prekey_does_not_discard_a_sibling_with_the_accepted_identity() {
+    let old_peer = device("delayed-old-peer");
+    let new_peer = device("delayed-new-peer");
+    let receiver = device("delayed-receiver");
+    let peer_addr = address("111");
+    let receiver_addr = address("222");
+    connect(&old_peer, &receiver, &receiver_addr);
+    let first = block_on(
+        old_peer
+            .ops
+            .encrypt(&receiver_addr, &padded(&text("authored first chat"))),
+    )
+    .unwrap();
+    block_on(
+        receiver
+            .ops
+            .decrypt(&peer_addr, first.kind, &first.ciphertext),
+    )
+    .unwrap();
+    let delayed = block_on(
+        old_peer
+            .ops
+            .encrypt(&receiver_addr, &padded(&text("authored delayed chat"))),
+    )
+    .unwrap();
+    // The new bundle archives the old chat ratchet, while the status peer uses B.
+    connect(&receiver, &new_peer, &peer_addr);
+    connect(&new_peer, &receiver, &receiver_addr);
+    let status = block_on(
+        new_peer
+            .ops
+            .encrypt(&receiver_addr, &padded(&text("authored new status"))),
+    )
+    .unwrap();
+    message(
+        block_on(receiver.ops.receive_status(
+            request(
+                "status@broadcast",
+                &peer_addr,
+                kind(&status),
+                &status.ciphertext,
+                false,
+            ),
+            true,
+        ))
+        .unwrap(),
+    );
+    let key = format!("{}_status", peer_addr.as_str());
+    let retained = block_on(receiver.store.get_session(&key)).unwrap().unwrap();
+    block_on(
+        receiver
+            .ops
+            .decrypt(&peer_addr, delayed.kind, &delayed.ciphertext),
+    )
+    .unwrap();
+    assert_eq!(
+        block_on(receiver.store.get_session(&key)).unwrap(),
+        Some(retained.clone())
+    );
+    connect(&receiver, &new_peer, &peer_addr);
+    assert_eq!(
+        block_on(receiver.store.get_session(&key)).unwrap(),
+        Some(retained)
+    );
+}

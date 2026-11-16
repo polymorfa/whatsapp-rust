@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use wacore::libsignal::protocol::{
     CiphertextMessageType, DeviceId, IdentityKey, KeyPair, PreKeyBundle, PreKeySignalMessage,
-    ProtocolAddress, PublicKey, SenderKeyDistributionMessage, SignalMessage, UsePQRatchet,
-    create_sender_key_distribution_message, group_decrypt, group_encrypt, message_decrypt_prekey,
-    message_decrypt_signal, message_encrypt, process_prekey_bundle,
+    ProtocolAddress, PublicKey, SenderKeyDistributionMessage, SessionRecord, SignalMessage,
+    UsePQRatchet, create_sender_key_distribution_message, group_decrypt, group_encrypt,
+    message_decrypt_prekey, message_decrypt_signal, message_encrypt, process_prekey_bundle,
     process_sender_key_distribution_message,
 };
 use wacore::libsignal::store::record_helpers;
@@ -640,9 +640,36 @@ impl<S: ServiceStore> SignalOps<S> {
             identity_change,
             wacore::libsignal::protocol::IdentityChange::ReplacedExisting
         ) {
-            staged
-                .delete_session(&format!("{}_status", address.as_str()))
-                .await?;
+            self.invalidate_sibling_identity(
+                staged,
+                &format!("{}_status", address.as_str()),
+                bundle.identity_key()?,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    // The identity row may reflect a delayed archived prekey, while the
+    // sibling ratchet already belongs to the identity being accepted.
+    async fn invalidate_sibling_identity(
+        &self,
+        staged: &Arc<S>,
+        key: &str,
+        accepted: &IdentityKey,
+    ) -> Result<(), OpsError> {
+        if let Some(bytes) = staged.get_session(key).await? {
+            let record =
+                SessionRecord::deserialize_for_store(&bytes, crate::stores::incarnation())?;
+            if let Some(state) = record.session_state() {
+                let identity = state.remote_identity_key().map_err(|_| {
+                    OpsError::InvalidInput("invalid sibling session identity".into())
+                })?;
+                if identity.as_ref() == Some(accepted) {
+                    return Ok(());
+                }
+            }
+            staged.delete_session(key).await?;
         }
         Ok(())
     }
@@ -727,7 +754,16 @@ impl<S: ServiceStore> SignalOps<S> {
             } else {
                 format!("{}_status", sender.as_str())
             };
-            staged.delete_session(&other).await?;
+            let identity = staged
+                .load_identity(sender.as_str())
+                .await?
+                .ok_or_else(|| OpsError::InvalidInput("missing accepted identity".into()))?;
+            let accepted = IdentityKey::new(
+                PublicKey::from_djb_public_key_bytes(&identity)
+                    .map_err(wacore::libsignal::protocol::SignalProtocolError::from)?,
+            );
+            self.invalidate_sibling_identity(staged, &other, &accepted)
+                .await?;
         }
         Ok(Decrypted {
             plaintext: result.plaintext,
