@@ -187,7 +187,11 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
     .await;
 
     if had_session || result.is_ok() {
-        session.commit().await?;
+        // Identity writes can already be pending when checkout storage fails.
+        // Fan-out must discard that batch, just as for an acceptance-hook failure.
+        session.commit().await.map_err(|error| {
+            SignalProtocolError::PreKeyBundleFinalizationFailed(Box::new(error))
+        })?;
     } else {
         session.discard();
     }
