@@ -350,6 +350,7 @@ impl<S: ServiceStore> SignalOps<S> {
     pub(crate) async fn stores_over(&self, store: Arc<S>) -> Stores<S> {
         Stores {
             store,
+            status_session: false,
             keys: self.authority.keys.read().await.clone(),
             sender_key_locks: self.authority.sender_key_locks.clone(),
         }
@@ -484,6 +485,10 @@ impl<S: ServiceStore> SignalOps<S> {
         let mut found = Vec::new();
         for ns in [Namespace::Session, Namespace::Identity] {
             for address in self.store.scan_peer_addresses(ns, user).await? {
+                let address = address
+                    .strip_suffix("_status")
+                    .unwrap_or(&address)
+                    .to_owned();
                 if let Some(device) = device_of(&address, user, server) {
                     found.push((address, device));
                 }
@@ -516,7 +521,11 @@ impl<S: ServiceStore> SignalOps<S> {
         held.run(async {
             let batch: Vec<Arc<str>> = addresses.iter().map(|a| Arc::from(a.as_str())).collect();
             let staged = self.store.staged();
-            staged.delete_sessions_batch(&batch).await?;
+            let sessions: Vec<Arc<str>> = addresses
+                .iter()
+                .flat_map(|a| [Arc::from(a.as_str()), Arc::from(format!("{a}_status"))])
+                .collect();
+            staged.delete_sessions_batch(&sessions).await?;
             staged.delete_identities_batch(&batch).await?;
             staged.commit().await?;
             Ok(())
@@ -562,10 +571,14 @@ impl<S: ServiceStore> SignalOps<S> {
             let mut moved = 0;
             for (from, to) in &moves {
                 let mut changed = false;
-                if let Some(session) = staged.get_session(from).await? {
-                    staged.put_session(to, &session).await?;
-                    staged.delete_session(from).await?;
-                    changed = true;
+                for suffix in ["", "_status"] {
+                    let from_key = format!("{from}{suffix}");
+                    let to_key = format!("{to}{suffix}");
+                    if let Some(session) = staged.get_session(&from_key).await? {
+                        staged.put_session(&to_key, &session).await?;
+                        staged.delete_session(&from_key).await?;
+                        changed = true;
+                    }
                 }
                 if let Some(identity) = staged.load_identity(from).await? {
                     if staged.load_identity(to).await?.is_none() {
@@ -653,7 +666,20 @@ impl<S: ServiceStore> SignalOps<S> {
         kind: EncKind,
         ciphertext: &[u8],
     ) -> Result<Decrypted, OpsError> {
+        self.decrypt_into_scoped(staged, sender, kind, ciphertext, false)
+            .await
+    }
+
+    pub(crate) async fn decrypt_into_scoped(
+        &self,
+        staged: &Arc<S>,
+        sender: &ProtocolAddress,
+        kind: EncKind,
+        ciphertext: &[u8],
+        status_session: bool,
+    ) -> Result<Decrypted, OpsError> {
         let mut sessions = self.stores_over(staged.clone()).await;
+        sessions.status_session = status_session;
         let mut identities = sessions.clone();
         let result = match kind {
             EncKind::PreKey => {
@@ -682,6 +708,26 @@ impl<S: ServiceStore> SignalOps<S> {
         // the session that consumed it is not durable.
         if let Some(id) = result.consumed_prekey_id {
             staged.remove_prekey(id.into()).await?;
+        }
+        if matches!(
+            result.identity_change,
+            wacore::libsignal::protocol::IdentityChange::ReplacedExisting
+        ) {
+            // Keep the session just promoted and invalidate the other ratchet.
+            let other = if status_session {
+                sender.as_str().to_owned()
+            } else {
+                format!("{}_status", sender.as_str())
+            };
+            let identity = staged
+                .load_identity(sender.as_str())
+                .await?
+                .ok_or_else(|| OpsError::InvalidInput("missing accepted identity".into()))?;
+            let accepted = IdentityKey::new(
+                PublicKey::from_djb_public_key_bytes(&identity)
+                    .map_err(wacore::libsignal::protocol::SignalProtocolError::from)?,
+            );
+            crate::stores::invalidate_sibling_identity(staged.as_ref(), &other, &accepted).await?;
         }
         Ok(Decrypted {
             plaintext: result.plaintext,

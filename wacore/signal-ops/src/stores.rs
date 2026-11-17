@@ -41,8 +41,38 @@ where
     move |e| SignalProtocolError::BackendError(context, e.into())
 }
 
+// Keep sibling ratchets only when they belong to the accepted identity. A
+// delayed archived message can temporarily change the shared identity row.
+pub(crate) async fn invalidate_sibling_identity<S: SignalStore>(
+    store: &S,
+    key: &str,
+    accepted: &IdentityKey,
+) -> SignalResult<()> {
+    if let Some(bytes) = store
+        .get_session(key)
+        .await
+        .map_err(backend("load sibling session"))?
+    {
+        let record = SessionRecord::deserialize_for_store(&bytes, incarnation())?;
+        if let Some(state) = record.session_state() {
+            let identity = state.remote_identity_key().map_err(|_| {
+                SignalProtocolError::InvalidArgument("invalid sibling session identity".into())
+            })?;
+            if identity.as_ref() == Some(accepted) {
+                return Ok(());
+            }
+        }
+        store
+            .delete_session(key)
+            .await
+            .map_err(backend("delete sibling session"))?;
+    }
+    Ok(())
+}
+
 pub(crate) struct Stores<S> {
     pub store: Arc<S>,
+    pub status_session: bool,
     pub keys: Arc<DeviceKeys>,
     pub sender_key_locks: Arc<KeyedLocks>,
 }
@@ -51,6 +81,7 @@ impl<S> Clone for Stores<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
+            status_session: self.status_session,
             keys: self.keys.clone(),
             sender_key_locks: self.sender_key_locks.clone(),
         }
@@ -83,7 +114,11 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
     async fn load_session(&self, address: &ProtocolAddress) -> SignalResult<Option<SessionRecord>> {
         match self
             .store
-            .get_session(address.as_str())
+            .get_session(&if self.status_session {
+                format!("{}_status", address.as_str())
+            } else {
+                address.as_str().to_owned()
+            })
             .await
             .map_err(backend("load_session"))?
         {
@@ -95,9 +130,26 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
         }
     }
 
+    async fn on_prekey_bundle_accepted(
+        &mut self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> SignalResult<()> {
+        let sibling = if self.status_session {
+            address.as_str().to_owned()
+        } else {
+            format!("{}_status", address.as_str())
+        };
+        invalidate_sibling_identity(self.store.as_ref(), &sibling, identity).await
+    }
+
     async fn has_session(&self, address: &ProtocolAddress) -> SignalResult<bool> {
         self.store
-            .has_session(address.as_str())
+            .has_session(&if self.status_session {
+                format!("{}_status", address.as_str())
+            } else {
+                address.as_str().to_owned()
+            })
             .await
             .map_err(backend("has_session"))
     }
@@ -110,7 +162,14 @@ impl<S: SignalStore + 'static> SessionStore for Stores<S> {
         let mut bytes = Vec::new();
         record.serialize_into_for_store(&mut bytes, incarnation());
         self.store
-            .put_session(address.as_str(), &bytes)
+            .put_session(
+                &if self.status_session {
+                    format!("{}_status", address.as_str())
+                } else {
+                    address.as_str().to_owned()
+                },
+                &bytes,
+            )
             .await
             .map_err(backend("store_session"))
     }

@@ -385,6 +385,8 @@ pub async fn prepare_group_stanza_resolved(
             .await
             {
                 Ok(plan) => Some(plan),
+                // Remote recipient failures may be skipped; incomplete local state must abort the batch.
+                Err(error) if matches!(error.downcast_ref::<crate::libsignal::protocol::SignalProtocolError>(), Some(crate::libsignal::protocol::SignalProtocolError::PreKeyBundleFinalizationFailed(_))) => return Err(error),
                 Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
                     return Err(error.context("required sender-key session setup failed"));
                 }
@@ -526,6 +528,8 @@ pub async fn prepare_group_stanza_resolved(
                         }
                     }
                 }
+                // Remote recipient failures may be skipped; incomplete local state must abort the batch.
+                Err(error) if matches!(error.downcast_ref::<crate::libsignal::protocol::SignalProtocolError>(), Some(crate::libsignal::protocol::SignalProtocolError::PreKeyBundleFinalizationFailed(_))) => return Err(error),
                 Err(error) if distribution_policy == SenderKeyDistributionPolicy::Required => {
                     return Err(RequiredSenderKeyDistributionError::new(error, Vec::new()).into());
                 }

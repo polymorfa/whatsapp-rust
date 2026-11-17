@@ -493,7 +493,7 @@ impl SignalDevice {
                 .map_err(ops_error)?;
             let out = Object::new();
             match received {
-                Received::AlreadyDelivered { receipt_key } => {
+                Received::AlreadyDelivered { receipt_key, .. } => {
                     set(&out, "status", &JsValue::from_str("already_delivered"));
                     set(&out, "receiptKey", &JsValue::from_str(&receipt_key));
                 }

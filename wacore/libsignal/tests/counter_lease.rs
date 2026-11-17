@@ -900,3 +900,112 @@ fn waiving_burns_the_ceiling_into_archived_states_too() {
         .index;
     assert_eq!(archived_index, Some(ceiling));
 }
+
+struct BundleCommitStore {
+    inner: InMemorySessionStore,
+    fail_commit: bool,
+    accepted: usize,
+}
+
+#[async_trait]
+impl SessionStore for BundleCommitStore {
+    async fn load_session(
+        &self,
+        address: &ProtocolAddress,
+    ) -> wacore_libsignal::protocol::error::Result<Option<SessionRecord>> {
+        self.inner.load_session(address).await
+    }
+
+    async fn has_session(
+        &self,
+        address: &ProtocolAddress,
+    ) -> wacore_libsignal::protocol::error::Result<bool> {
+        self.inner.has_session(address).await
+    }
+
+    async fn store_session(
+        &mut self,
+        address: &ProtocolAddress,
+        record: SessionRecord,
+    ) -> wacore_libsignal::protocol::error::Result<()> {
+        if self.fail_commit {
+            return Err(SignalProtocolError::BackendError(
+                "authored session commit failure",
+                std::io::Error::other("authored unavailable session store").into(),
+            ));
+        }
+        self.inner.store_session(address, record).await
+    }
+
+    async fn on_prekey_bundle_accepted(
+        &mut self,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
+    ) -> wacore_libsignal::protocol::error::Result<()> {
+        self.accepted += 1;
+        Ok(())
+    }
+}
+
+#[test]
+fn bundle_commit_errors_require_the_enclosing_batch_to_abort() {
+    let mut initiator = Peer::new("authored-commit-initiator");
+    let target = Peer::new("authored-commit-target");
+    let bundle = BUNDLES.with(|b| b.borrow().get(&target.address).cloned().unwrap());
+    let mut store = BundleCommitStore {
+        inner: InMemorySessionStore::default(),
+        fail_commit: true,
+        accepted: 0,
+    };
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    let error = futures::executor::block_on(process_prekey_bundle(
+        &target.address,
+        &mut store,
+        &mut initiator.identity_store,
+        &bundle,
+        &mut rng,
+        UsePQRatchet::No,
+    ))
+    .unwrap_err();
+    // Identity storage precedes checkout commit. Fan-out must discard this
+    // pending identity instead of treating the device as an ordinary drop.
+    assert_eq!(
+        initiator.identity_store.identities.get(&target.address),
+        Some(bundle.identity_key().unwrap())
+    );
+    assert_eq!(store.accepted, 0);
+    assert!(store.inner.0.is_empty());
+    match error {
+        SignalProtocolError::PreKeyBundleFinalizationFailed(cause) => {
+            assert!(matches!(
+                *cause,
+                SignalProtocolError::BackendError("authored session commit failure", _)
+            ));
+        }
+        other => panic!("commit failure did not require batch abort: {other}"),
+    }
+}
+
+#[test]
+fn a_successful_bundle_commit_runs_acceptance_once() {
+    let mut initiator = Peer::new("authored-success-initiator");
+    let target = Peer::new("authored-success-target");
+    let bundle = BUNDLES.with(|b| b.borrow().get(&target.address).cloned().unwrap());
+    let mut store = BundleCommitStore {
+        inner: InMemorySessionStore::default(),
+        fail_commit: false,
+        accepted: 0,
+    };
+    let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+    futures::executor::block_on(process_prekey_bundle(
+        &target.address,
+        &mut store,
+        &mut initiator.identity_store,
+        &bundle,
+        &mut rng,
+        UsePQRatchet::No,
+    ))
+    .unwrap();
+    assert_eq!(store.accepted, 1);
+    assert!(store.inner.0.contains_key(&target.address));
+}

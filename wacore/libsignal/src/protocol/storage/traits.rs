@@ -222,6 +222,19 @@ pub trait SessionStore: ThreadSafe {
     /// Destructive cache checkouts belong in `load_session_for_update`.
     async fn load_session(&self, address: &ProtocolAddress) -> Result<Option<SessionRecord>>;
 
+    /// Finish local state work after a verified prekey bundle is accepted.
+    /// Scoped stores can invalidate sibling ratchets in the same transaction.
+    /// The default leaves existing unscoped stores unchanged. This hook must
+    /// not publish ciphertext or perform network work.
+    async fn on_prekey_bundle_accepted(
+        &mut self,
+        address: &ProtocolAddress,
+        identity: &IdentityKey,
+    ) -> Result<()> {
+        let _ = (address, identity);
+        Ok(())
+    }
+
     /// Hint to fault `addresses` into the store in one backend round-trip.
     ///
     /// A send fans out over every device, and without this each device pays its

@@ -109,7 +109,7 @@ impl SendContextResolver for FakeClient {
     }
 }
 
-async fn bundle_for(ops: &SignalOps<Store>) -> PreKeyBundle {
+async fn bundle_for<S: wacore_signal_ops::ServiceStore>(ops: &SignalOps<S>) -> PreKeyBundle {
     let identity = ops.public_identity().await;
     let prekey = ops.generate_prekeys(1).await.unwrap().remove(0);
     PreKeyBundle::new(
@@ -991,4 +991,278 @@ async fn a_corrupt_record_is_pruned_instead_of_stopping_the_prune() {
             .unwrap()
             .is_none()
     );
+}
+
+#[derive(Default)]
+struct BundleFaultRecords {
+    inner: MemoryRecordStore,
+    fail_status_read: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl wacore_recordstore::RecordStore for BundleFaultRecords {
+    async fn get(
+        &self,
+        scope: &str,
+        ns: wacore_recordstore::Namespace,
+        key: &str,
+    ) -> wacore::store::error::Result<Option<Vec<u8>>> {
+        if ns == wacore_recordstore::Namespace::Session
+            && key.ends_with("_status")
+            && self
+                .fail_status_read
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(wacore::store::error::StoreError::Io(std::io::Error::other(
+                "authored sibling read failure",
+            )));
+        }
+        self.inner.get(scope, ns, key).await
+    }
+    async fn scan_keys(
+        &self,
+        scope: &str,
+        ns: wacore_recordstore::Namespace,
+        prefix: &str,
+        limit: Option<usize>,
+    ) -> wacore::store::error::Result<Vec<String>> {
+        self.inner.scan_keys(scope, ns, prefix, limit).await
+    }
+    async fn write(
+        &self,
+        fence: &wacore_recordstore::Fence,
+        ops: &[wacore_recordstore::WriteOp],
+    ) -> wacore::store::error::Result<()> {
+        self.inner.write(fence, ops).await
+    }
+}
+
+async fn cold_status_identity_case(route: &str, fail_sibling: bool) {
+    use wacore::store::traits::SignalStore;
+    use wacore::types::message::AddressingMode;
+    use wacore_signal_ops::{RetryRequest, RetryRoute};
+    let own: Jid = "111:1@s.whatsapp.net".parse().unwrap();
+    let peer: Jid = "222:1@s.whatsapp.net".parse().unwrap();
+    let records = Arc::new(BundleFaultRecords::default());
+    let lease = records
+        .inner
+        .acquire(route, "authored-node", 0, 60_000)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = Arc::new(RecordSignalStore::new(
+        records.clone(),
+        Arc::new(AesGcmSealer::new(&[5; 32])),
+        lease.fence,
+    ));
+    let receiver = SignalOps::create(store.clone()).await.unwrap();
+    common::pair(&receiver).await;
+    receiver
+        .set_own_jids(&own.to_string(), Some("900111:1@lid"))
+        .await
+        .unwrap();
+    let old_peer = device("authored-old-peer", &peer.to_string()).await;
+    let new_peer = device("authored-new-peer", &peer.to_string()).await;
+    let status_client = FakeClient {
+        devices: vec![own.clone()],
+        bundles: HashMap::from([(own.clone(), bundle_for(&receiver).await)]),
+        group: None,
+    };
+    let status = old_peer
+        .send_direct(
+            &TokioRuntime,
+            &status_client,
+            &own.to_non_ad(),
+            &text("authored old status"),
+            "OLD1",
+        )
+        .await
+        .unwrap();
+    let delayed = old_peer
+        .send_direct(
+            &TokioRuntime,
+            &status_client,
+            &own.to_non_ad(),
+            &text("authored delayed old status"),
+            "OLD2",
+        )
+        .await
+        .unwrap();
+    let (kind, version, ciphertext) = enc_for(&status.stanza, &own);
+    let address = peer.to_protocol_address();
+    receiver
+        .receive_status(
+            ReceiveRequest {
+                chat: "status@broadcast",
+                sender: &address,
+                kind: ReceiveKind::try_from(kind.as_str()).unwrap(),
+                ciphertext: &ciphertext,
+                padding_version: version,
+                is_from_me: false,
+            },
+            true,
+        )
+        .await
+        .unwrap();
+    let status_key = format!("{}_status", address.as_str());
+    assert!(store.get_session(&status_key).await.unwrap().is_some());
+    if route == "retry" {
+        let initial = FakeClient {
+            devices: vec![peer.clone()],
+            bundles: HashMap::from([(peer.clone(), bundle_for(&old_peer).await)]),
+            group: None,
+        };
+        receiver
+            .send_direct(
+                &TokioRuntime,
+                &initial,
+                &peer.to_non_ad(),
+                &text("authored original send"),
+                "RETRY",
+            )
+            .await
+            .unwrap();
+        store.delete_session(address.as_str()).await.unwrap();
+    }
+    let healthy_jid: Jid = "222:2@s.whatsapp.net".parse().unwrap();
+    let healthy = device("authored-healthy-device", &healthy_jid.to_string()).await;
+    let before_chat = store.get_session(address.as_str()).await.unwrap();
+    let before_status = store.get_session(&status_key).await.unwrap();
+    let before_identity = store.load_identity(address.as_str()).await.unwrap();
+    records
+        .fail_status_read
+        .store(fail_sibling, std::sync::atomic::Ordering::SeqCst);
+    let client = FakeClient {
+        devices: vec![peer.clone(), healthy_jid.clone()],
+        bundles: HashMap::from([
+            (peer.clone(), bundle_for(&new_peer).await),
+            (healthy_jid.clone(), bundle_for(&healthy).await),
+        ]),
+        group: Some(Arc::new(GroupRoutingInfo::new(
+            vec![own.to_non_ad(), peer.to_non_ad()],
+            AddressingMode::Pn,
+        ))),
+    };
+    let result = match route {
+        "direct" => receiver
+            .send_direct(
+                &TokioRuntime,
+                &client,
+                &peer.to_non_ad(),
+                &text("authored new chat"),
+                "NEW",
+            )
+            .await
+            .map(|_| ()),
+        "group" => receiver
+            .send_group(
+                &TokioRuntime,
+                &client,
+                &"120363000000001@g.us".parse().unwrap(),
+                &text("authored new group"),
+                "GROUP",
+            )
+            .await
+            .map(|_| ()),
+        _ => receiver
+            .resend(
+                &client,
+                RetryRequest {
+                    chat: &peer.to_non_ad(),
+                    message_id: "RETRY",
+                    requester: &peer,
+                    encryption_jid: &peer,
+                    route: RetryRoute::Direct { recipient: None },
+                    retry_count: 2,
+                    bundle: None,
+                },
+            )
+            .await
+            .map(|_| ()),
+    };
+    if fail_sibling {
+        assert!(
+            result.is_err(),
+            "{route} published a cohort after sibling invalidation failed"
+        );
+        assert!(
+            !records
+                .fail_status_read
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(
+            store.get_session(address.as_str()).await.unwrap(),
+            before_chat
+        );
+        assert_eq!(store.get_session(&status_key).await.unwrap(), before_status);
+        assert_eq!(
+            store.load_identity(address.as_str()).await.unwrap(),
+            before_identity
+        );
+        assert!(
+            store
+                .get_session(healthy_jid.to_protocol_address().as_str())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        return;
+    }
+    result.unwrap();
+    assert!(
+        store.get_session(&status_key).await.unwrap().is_none(),
+        "old status survived {route}"
+    );
+    assert_eq!(
+        store.load_identity(address.as_str()).await.unwrap(),
+        Some(new_peer.public_identity().await.identity_key)
+    );
+    let (kind, version, ciphertext) = enc_for(&delayed.stanza, &own);
+    assert!(
+        receiver
+            .receive_status(
+                ReceiveRequest {
+                    chat: "status@broadcast",
+                    sender: &address,
+                    kind: ReceiveKind::try_from(kind.as_str()).unwrap(),
+                    ciphertext: &ciphertext,
+                    padding_version: version,
+                    is_from_me: false
+                },
+                true
+            )
+            .await
+            .is_err(),
+        "delayed old status accepted after {route}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_direct_invalidates_an_old_status_identity() {
+    cold_status_identity_case("direct", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_group_invalidates_an_old_status_identity() {
+    cold_status_identity_case("group", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_retry_invalidates_an_old_status_identity() {
+    cold_status_identity_case("retry", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_status_invalidation_aborts_the_direct_batch() {
+    cold_status_identity_case("direct", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_status_invalidation_aborts_the_group_batch() {
+    cold_status_identity_case("group", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_status_invalidation_aborts_the_retry_batch() {
+    cold_status_identity_case("retry", true).await;
 }
