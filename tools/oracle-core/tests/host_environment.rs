@@ -299,8 +299,8 @@ fn the_guest_heap_can_grow() {
 mod wasi_fixture {
     use wasm_encoder::{
         CodeSection, EntityType, ExportKind, ExportSection, Function, FunctionSection,
-        ImportSection, Instruction, MemArg, MemorySection, MemoryType, Module, TypeSection,
-        ValType,
+        ImportSection, Instruction, MemArg, MemArgTarget, MemorySection, MemoryType, Module,
+        TypeSection, ValType,
     };
 
     /// Where the guest puts things. Fixed addresses, so the test can read them.
@@ -327,7 +327,8 @@ mod wasi_fixture {
         MemArg {
             offset,
             align: 2,
-            memory_index: 0,
+            target: MemArgTarget::Memory(0),
+            ordering: None,
         }
     }
 
@@ -877,8 +878,8 @@ fn a_host_callback_can_read_an_imported_memory_that_is_never_exported() {
 #[test]
 fn a_plain_main_receives_the_arguments_it_was_given() {
     use wasm_encoder::{
-        CodeSection, ExportKind, ExportSection, Function, FunctionSection, MemArg, MemorySection,
-        MemoryType, Module, TypeSection, ValType,
+        CodeSection, ExportKind, ExportSection, Function, FunctionSection, MemArg, MemArgTarget,
+        MemorySection, MemoryType, Module, TypeSection, ValType,
     };
 
     /// Where `main` records what it was handed, clear of the argv block.
@@ -890,7 +891,8 @@ fn a_plain_main_receives_the_arguments_it_was_given() {
         MemArg {
             offset,
             align: 2,
-            memory_index: 0,
+            target: MemArgTarget::Memory(0),
+            ordering: None,
         }
     }
 
@@ -926,7 +928,8 @@ fn a_plain_main_receives_the_arguments_it_was_given() {
         f.local_get(1).i32_load(word(4)).i32_load8_u(MemArg {
             offset: 0,
             align: 0,
-            memory_index: 0,
+            target: MemArgTarget::Memory(0),
+            ordering: None,
         });
         f.end();
     }
