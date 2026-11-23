@@ -41,7 +41,7 @@ wacore-binary = { workspace = true }
 # native SQLite bundling; use Diesel's complementary target condition so it
 # cannot pull a native C build into the WebAssembly dependency graph.
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
-libsqlite3-sys = { version = "0.38", default-features = false, optional = true }
+libsqlite3-sys = { version = "0.40", default-features = false, optional = true }
 
 [build-dependencies]
 buffa-build = { workspace = true }
